@@ -98,12 +98,14 @@ struct wal_writer
 	struct xlog current_wal;
 	/** true if wal file is opened */
 	bool is_active;
+	/** The last created batch for write */
+	struct wal_msg *last_batch;
 	/**
 	 * Used if there was a WAL I/O error and we need to
 	 * keep adding all incoming requests to the rollback
 	 * queue, until the tx thread has recovered.
 	 */
-	struct cmsg in_rollback;
+	struct cmsg_routed in_rollback;
 	/**
 	 * WAL watchers, i.e. threads that should be alerted
 	 * whenever there are new records appended to the journal.
@@ -114,7 +116,7 @@ struct wal_writer
 	pthread_mutex_t watchers_mutex;
 };
 
-struct wal_msg: public cmsg {
+struct wal_msg: public cmsg_routed {
 	/** Input queue, on output contains all committed requests. */
 	struct stailq commit;
 	/**
@@ -155,15 +157,9 @@ static struct cmsg_hop wal_request_route[] = {
 static void
 wal_msg_create(struct wal_msg *batch)
 {
-	cmsg_init(batch, wal_request_route);
 	stailq_create(&batch->commit);
 	stailq_create(&batch->rollback);
-}
-
-static struct wal_msg *
-wal_msg(struct cmsg *msg)
-{
-	return msg->route == wal_request_route ? (struct wal_msg *) msg : NULL;
+	wal->last_batch = batch;
 }
 
 /** Write a request to a log in a single transaction. */
@@ -268,7 +264,7 @@ wal_writer_create(struct wal_writer *writer, enum wal_mode wal_mode,
 		writer->wal_dir.open_wflags |= O_SYNC;
 
 	stailq_create(&writer->rollback);
-	cmsg_init(&writer->in_rollback, NULL);
+	writer->in_rollback.route = NULL;
 
 	/* Create and fill writer->vclock. */
 	vclock_create(&writer->vclock);
@@ -346,7 +342,7 @@ wal_thread_stop()
 	rmean_tx_wal_bus = NULL;
 }
 
-struct wal_checkpoint: public cmsg
+struct wal_checkpoint: public cmsg_routed
 {
 	struct vclock *vclock;
 	struct fiber *fiber;
@@ -391,11 +387,10 @@ wal_checkpoint(struct vclock *vclock, bool rotate)
 	};
 	vclock_create(vclock);
 	struct wal_checkpoint msg;
-	cmsg_init(&msg, wal_checkpoint_route);
 	msg.vclock = vclock;
 	msg.fiber = fiber();
 	msg.rotate = rotate;
-	cpipe_push(&wal_thread.wal_pipe, &msg);
+	cpipe_push_routed(&wal_thread.wal_pipe, &msg, wal_checkpoint_route);
 	fiber_set_cancellable(false);
 	fiber_yield();
 	fiber_set_cancellable(true);
@@ -458,7 +453,7 @@ wal_writer_end_rollback(struct cmsg *msg)
 {
 	(void) msg;
 	struct wal_writer *writer = wal;
-	cmsg_init(&writer->in_rollback, NULL);
+	writer->in_rollback.route = NULL;
 }
 
 static void
@@ -491,8 +486,7 @@ wal_writer_begin_rollback(struct wal_writer *writer)
 	 * Make sure the WAL writer rolls back
 	 * all input until rollback mode is off.
 	 */
-	cmsg_init(&writer->in_rollback, rollback_route);
-	cpipe_push(&wal_thread.tx_pipe, &writer->in_rollback);
+	cpipe_push_routed(&wal_thread.tx_pipe, &writer->in_rollback, rollback_route);
 }
 
 static void
@@ -658,9 +652,9 @@ wal_write(struct wal_request *req)
 
 	struct wal_msg *batch;
 	if (!stailq_empty(&wal_thread.wal_pipe.input) &&
-	    (batch = wal_msg(stailq_first_entry(&wal_thread.wal_pipe.input,
-						struct cmsg, fifo)))) {
-
+	    stailq_first_entry(&wal_thread.wal_pipe.input, struct cmsg, fifo) ==
+	    (struct cmsg *)writer->last_batch) {
+		batch = writer->last_batch;
 		stailq_add_tail_entry(&batch->commit, req, fifo);
 	} else {
 		batch = (struct wal_msg *)
@@ -673,7 +667,7 @@ wal_write(struct wal_request *req)
 		 * thread right away.
 		 */
 		stailq_add_tail_entry(&batch->commit, req, fifo);
-		cpipe_push(&wal_thread.wal_pipe, batch);
+		cpipe_push_routed(&wal_thread.wal_pipe, batch, wal_request_route);
 	}
 	wal_thread.wal_pipe.n_input += req->n_rows * XROW_IOVMAX;
 	cpipe_flush_input(&wal_thread.wal_pipe);
@@ -686,6 +680,8 @@ wal_write(struct wal_request *req)
 	bool cancellable = fiber_set_cancellable(false);
 	fiber_yield(); /* Request was inserted. */
 	fiber_set_cancellable(cancellable);
+	if (batch == wal->last_batch)
+		wal->last_batch = NULL;
 	return req->res;
 }
 

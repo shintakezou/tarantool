@@ -84,6 +84,11 @@ struct cmsg {
 	 * delivered.
 	 */
 	struct stailq_entry fifo;
+	cmsg_f handler;
+};
+
+struct cmsg_routed {
+	struct cmsg base;
 	/** The message routing path. */
 	const struct cmsg_hop *route;
 	/** The current hop the message is at. */
@@ -92,22 +97,14 @@ struct cmsg {
 
 static inline struct cmsg *cmsg(void *ptr) { return (struct cmsg *) ptr; }
 
-/** Initialize the message and set its route. */
-static inline void
-cmsg_init(struct cmsg *msg, const struct cmsg_hop *route)
-{
-	/**
-	 * The first hop can be done explicitly with cbus_push(),
-	 * msg->hop thus points to the second hop.
-	 */
-	msg->hop = msg->route = route;
-}
-
 /**
  * Deliver the message and dispatch it to the next hop.
  */
 void
 cmsg_deliver(struct cmsg *msg);
+
+void
+cmsg_deliver_routed(struct cmsg *msg);
 
 /** A  uni-directional FIFO queue from one cord to another. */
 struct cpipe {
@@ -207,10 +204,11 @@ cpipe_flush_input(struct cpipe *pipe)
  * flushed with cpipe_flush_input().
  */
 static inline void
-cpipe_push_input(struct cpipe *pipe, struct cmsg *msg)
+cpipe_push_input(struct cpipe *pipe, struct cmsg *msg, cmsg_f handler)
 {
 	assert(loop() == pipe->producer);
 
+	msg->handler = handler;
 	stailq_add_tail_entry(&pipe->input, msg, fifo);
 	pipe->n_input++;
 	if (pipe->n_input >= pipe->max_input)
@@ -224,12 +222,30 @@ cpipe_push_input(struct cpipe *pipe, struct cmsg *msg)
  * messages coming up.
  */
 static inline void
-cpipe_push(struct cpipe *pipe, struct cmsg *msg)
+cpipe_push(struct cpipe *pipe, struct cmsg *msg, cmsg_f handler)
 {
-	cpipe_push_input(pipe, msg);
+	cpipe_push_input(pipe, msg, handler);
 	assert(pipe->n_input < pipe->max_input);
 	if (pipe->n_input == 1)
 		ev_feed_event(pipe->producer, &pipe->flush_input, EV_CUSTOM);
+}
+
+static inline void
+cpipe_push_routed_input(struct cpipe *pipe, struct cmsg_routed *msg,
+			const struct cmsg_hop *route)
+{
+	msg->route = route;
+	msg->hop = route;
+	cpipe_push_input(pipe, &msg->base, cmsg_deliver_routed);
+}
+
+static inline void
+cpipe_push_routed(struct cpipe *pipe, struct cmsg_routed *msg,
+		  const struct cmsg_hop *route)
+{
+	msg->route = route;
+	msg->hop = route;
+	cpipe_push(pipe, &msg->base, cmsg_deliver_routed);
 }
 
 void
@@ -353,7 +369,7 @@ struct cbus_call_msg
 	struct cmsg msg;
 	struct diag diag;
 	struct fiber *caller;
-	struct cmsg_hop route[2];
+	struct cpipe *caller_pipe;
 	bool complete;
 	int rc;
 	/** The callback to invoke in the peer thread. */

@@ -117,15 +117,11 @@ cbus_endpoint_poison_f(struct cmsg *msg)
 void
 cpipe_destroy(struct cpipe *pipe)
 {
-	static const struct cmsg_hop route[1] = {
-		{cbus_endpoint_poison_f, NULL}
-	};
 	struct cmsg_poison *poison = malloc(sizeof(struct cmsg_poison));
 	poison->endpoint = pipe->endpoint;
-	cmsg_init(&poison->msg, route);
 	poison->endpoint = pipe->endpoint;
 
-	cpipe_push(pipe, &poison->msg);
+	cpipe_push(pipe, &poison->msg, cbus_endpoint_poison_f);
 	ev_invoke(pipe->producer, &pipe->flush_input, EV_CUSTOM);
 
 	ev_async_stop(pipe->producer, &pipe->flush_input);
@@ -269,7 +265,7 @@ cbus_free()
  * Dispatch the message to the next hop.
  */
 static inline void
-cmsg_dispatch(struct cpipe *pipe, struct cmsg *msg)
+cmsg_dispatch(struct cpipe *pipe, struct cmsg_routed *msg)
 {
 	/**
 	 * 'pipe' pointer saved in class constructor works as
@@ -286,40 +282,31 @@ cmsg_dispatch(struct cpipe *pipe, struct cmsg *msg)
 		 * push.
 		 */
 		msg->hop++;
-		cpipe_push(pipe, msg);
+		cpipe_push(pipe, &msg->base, cmsg_deliver_routed);
 	}
 }
 
-/**
- * Deliver the message and dispatch it to the next hop.
- */
 void
 cmsg_deliver(struct cmsg *msg)
 {
+	msg->handler(msg);
+}
+
+void
+cmsg_deliver_routed(struct cmsg *msg)
+{
+	struct cmsg_routed *routed = (struct cmsg_routed *)msg;
 	/*
 	 * Save the pointer to the last pipe,
 	 * the memory where it is stored may be destroyed
 	 * on the last hop.
 	 */
-	struct cpipe *pipe = msg->hop->pipe;
-	msg->hop->f(msg);
-	cmsg_dispatch(pipe, msg);
+	struct cpipe *pipe = routed->hop->pipe;
+	routed->hop->f(msg);
+	cmsg_dispatch(pipe, routed);
 }
 
 /* }}} cmsg */
-
-/**
- * Call the target function and store the results (diag, rc) in
- * struct cbus_call_msg.
- */
-void
-cbus_call_perform(struct cmsg *m)
-{
-	struct cbus_call_msg *msg = (struct cbus_call_msg *)m;
-	msg->rc = msg->func(msg);
-	if (msg->rc)
-		diag_move(&fiber()->diag, &msg->diag);
-}
 
 /**
  * Wake up the caller fiber to reap call results.
@@ -340,6 +327,20 @@ cbus_call_done(struct cmsg *m)
 }
 
 /**
+ * Call the target function and store the results (diag, rc) in
+ * struct cbus_call_msg.
+ */
+void
+cbus_call_perform(struct cmsg *m)
+{
+	struct cbus_call_msg *msg = (struct cbus_call_msg *)m;
+	msg->rc = msg->func(msg);
+	if (msg->rc)
+		diag_move(&fiber()->diag, &msg->diag);
+	cpipe_push(msg->caller_pipe, m, cbus_call_done);
+}
+
+/**
  * Execute a synchronous call over cbus.
  */
 int
@@ -350,18 +351,13 @@ cbus_call(struct cpipe *callee, struct cpipe *caller, struct cbus_call_msg *msg,
 
 	diag_create(&msg->diag);
 	msg->caller = fiber();
+	msg->caller_pipe = caller;
 	msg->complete = false;
-	msg->route[0].f = cbus_call_perform;
-	msg->route[0].pipe = caller;
-	msg->route[1].f = cbus_call_done;
-	msg->route[1].pipe = NULL;
-	cmsg_init(cmsg(msg), msg->route);
-
 	msg->func = func;
 	msg->free_cb = free_cb;
 	msg->rc = 0;
 
-	cpipe_push(callee, cmsg(msg));
+	cpipe_push(callee, cmsg(msg), cbus_call_perform);
 
 	fiber_yield_timeout(timeout);
 	if (msg->complete == false) {           /* timed out or cancelled */
@@ -409,18 +405,9 @@ cbus_stop_loop_f(struct cmsg *msg)
 void
 cbus_stop_loop(struct cpipe *pipe)
 {
-	/*
-	 * Hack: static message only works because cmsg_deliver()
-	 * is a no-op on the second hop.
-	 */
-	static const struct cmsg_hop route[1] = {
-		{cbus_stop_loop_f, NULL}
-	};
 	struct cmsg *cancel = malloc(sizeof(struct cmsg));
 
-	cmsg_init(cancel, route);
-
-	cpipe_push(pipe, cancel);
+	cpipe_push(pipe, cancel, cbus_stop_loop_f);
 	ev_invoke(pipe->producer, &pipe->flush_input, EV_CUSTOM);
 }
 

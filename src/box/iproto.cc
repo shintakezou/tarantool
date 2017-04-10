@@ -69,7 +69,7 @@ enum { IPROTO_MSG_MAX = 768 };
  * from all connections are queued into a single queue
  * and processed in FIFO order.
  */
-struct iproto_msg: public cmsg
+struct iproto_msg: public cmsg_routed
 {
 	struct iproto_connection *connection;
 
@@ -119,7 +119,7 @@ iproto_resume();
 
 
 static inline void
-iproto_msg_delete(struct cmsg *msg)
+iproto_msg_delete(struct iproto_msg *msg)
 {
 	mempool_free(&iproto_msg_pool, msg);
 	iproto_resume();
@@ -408,7 +408,6 @@ iproto_connection_new(const char *name, int fd)
 	rlist_create(&con->in_stop_list);
 	/* It may be very awkward to allocate at close. */
 	con->disconnect = iproto_msg_new(con);
-	cmsg_init(con->disconnect, disconnect_route);
 	return con;
 }
 
@@ -453,7 +452,7 @@ iproto_connection_close(struct iproto_connection *con)
 		assert(con->disconnect != NULL);
 		struct iproto_msg *msg = con->disconnect;
 		con->disconnect = NULL;
-		cpipe_push(&tx_pipe, msg);
+		cpipe_push_routed(&tx_pipe, msg, disconnect_route);
 	}
 	rlist_del(&con->in_stop_list);
 }
@@ -551,7 +550,7 @@ iproto_connection_input_iobuf(struct iproto_connection *con)
 	return newbuf;
 }
 
-static void
+static const struct cmsg_hop *
 iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 		  bool *stop_input)
 {
@@ -586,21 +585,16 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 				 (const char *) msg->header.body[0].iov_base,
 				 msg->header.body[0].iov_len);
 		assert(msg->header.type < sizeof(dml_route)/sizeof(*dml_route));
-		cmsg_init(msg, dml_route[msg->header.type]);
-		break;
+		return dml_route[msg->header.type];
 	case IPROTO_PING:
-		cmsg_init(msg, misc_route);
-		break;
+		return misc_route;
 	case IPROTO_JOIN:
 	case IPROTO_SUBSCRIBE:
-		cmsg_init(msg, sync_route);
 		*stop_input = true;
-		break;
-	default:
-		tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
-			  (uint32_t) msg->header.type);
-		break;
+		return sync_route;
 	}
+	tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
+		  (uint32_t) msg->header.type);
 }
 
 /** Enqueue all requests which were read up. */
@@ -630,8 +624,9 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 		msg->len = reqend - reqstart; /* total request length */
 
 		try {
-			iproto_decode_msg(msg, &pos, reqend, &stop_input);
-			cpipe_push_input(&tx_pipe, guard.release());
+			const struct cmsg_hop *route;
+			route = iproto_decode_msg(msg, &pos, reqend, &stop_input);
+			cpipe_push_routed_input(&tx_pipe, guard.release(), route);
 			n_requests++;
 		} catch (Exception *e) {
 			/*
@@ -1137,10 +1132,9 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 	 * use, all stored in just a few blocks of the memory pool.
 	 */
 	struct iproto_msg *msg = iproto_msg_new(con);
-	cmsg_init(msg, connect_route);
 	msg->iobuf = con->iobuf[0];
 	msg->close_connection = false;
-	cpipe_push(&tx_pipe, msg);
+	cpipe_push_routed(&tx_pipe, msg, connect_route);
 }
 
 static struct evio_service binary; /* iproto binary listener */
