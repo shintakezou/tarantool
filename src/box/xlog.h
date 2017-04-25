@@ -456,6 +456,7 @@ struct xlog_tx_cursor
 {
 	/** rows buffer */
 	struct ibuf rows;
+	size_t size;
 };
 
 /**
@@ -486,6 +487,18 @@ xlog_tx_cursor_destroy(struct xlog_tx_cursor *tx_cursor);
  */
 int
 xlog_tx_cursor_next_row(struct xlog_tx_cursor *tx_cursor, struct xrow_header *xrow);
+
+/**
+ * Return current tx cursor position
+ *
+ * @param tx_cursor tx_cursor
+ * @retval current tx cursor position
+ */
+static inline off_t
+xlog_tx_cursor_pos(struct xlog_tx_cursor *tx_cursor)
+{
+	return tx_cursor->size - ibuf_used(&tx_cursor->rows);
+}
 
 /**
  * A conventional helper to decode rows from the raw tx buffer.
@@ -623,6 +636,29 @@ xlog_cursor_next(struct xlog_cursor *cursor,
 int
 xlog_cursor_find_tx_magic(struct xlog_cursor *i);
 
+/**
+ * Cursor xlog position
+ *
+ * @param cursor xlog cursor
+ * @retval xlog current position
+ */
+static inline off_t
+xlog_cursor_pos(struct xlog_cursor *cursor)
+{
+	return cursor->read_offset - ibuf_used(&cursor->rbuf);
+}
+
+/**
+ * Return tx positon for xlog cursor
+ *
+ * @param cursor xlog_cursor
+ * @retval current tx postion
+ */
+static inline off_t
+xlog_cursor_tx_pos(struct xlog_cursor *cursor)
+{
+	return xlog_tx_cursor_pos(&cursor->tx_cursor);
+}
 /* }}} */
 
 /** {{{ miscellaneous log io functions. */

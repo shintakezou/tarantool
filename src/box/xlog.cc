@@ -1362,15 +1362,6 @@ xlog_cursor_ensure(struct xlog_cursor *cursor, size_t count)
 }
 
 /**
- * Cursor parse position
- */
-static inline off_t
-xlog_cursor_pos(struct xlog_cursor *cursor)
-{
-	return cursor->read_offset - ibuf_used(&cursor->rbuf);
-}
-
-/**
  * Decompress zstd-compressed buf into cursor row block
  *
  * @retval -1 error, check diag
@@ -1583,6 +1574,7 @@ xlog_tx_cursor_create(struct xlog_tx_cursor *tx_cursor,
 		memcpy(dst, rpos, fixheader.len);
 		*data = (char *)rpos + fixheader.len;
 		assert(*data <= data_end);
+		tx_cursor->size = ibuf_used(&tx_cursor->rows);
 		return 0;
 	};
 
@@ -1605,6 +1597,7 @@ xlog_tx_cursor_create(struct xlog_tx_cursor *tx_cursor,
 
 	*data = rpos;
 	assert(*data <= data_end);
+	tx_cursor->size = ibuf_used(&tx_cursor->rows);
 	return 0;
 }
 
