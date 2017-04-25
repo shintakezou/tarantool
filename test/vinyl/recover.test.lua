@@ -90,3 +90,25 @@ test_run:cmd("setopt delimiter ''");
 check(6)
 
 s:drop()
+
+test_run:cmd('create server force_recovery with script="vinyl/force_recovery.lua"')
+test_run:cmd('start server force_recovery')
+test_run:cmd('switch force_recovery')
+_ = box.schema.space.create('test', {engine = 'vinyl'}):create_index('pk')
+for i = 0, 9999 do box.space.test:replace({i, i, string.rep('a', 512)}) end
+box.snapshot()
+for i = 10000, 11999 do box.space.test:delete({i}) end
+box.snapshot()
+for i = 12000, 13999 do box.space.test:upsert({i, i, string.rep('a', 128)}, {{'=', 4, 5}}) end
+box.snapshot()
+fio = require'fio'
+for _, f in pairs(fio.glob(box.cfg.vinyl_dir .. '/' .. box.space.test.id .. '/0/*.index')) do fio.unlink(f) end
+test_run = require('test_run').new()
+test_run:cmd('switch default')
+test_run:cmd('stop server force_recovery')
+test_run:cmd('start server force_recovery')
+test_run:cmd('switch force_recovery')
+#box.space.test:select()
+test_run:cmd('switch default')
+test_run:cmd('stop server force_recovery')
+

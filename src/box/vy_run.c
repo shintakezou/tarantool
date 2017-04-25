@@ -28,6 +28,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+#include "cfg.h"
 #include "vy_run.h"
 #include "fiber.h"
 #include "coeio.h"
@@ -1744,16 +1745,11 @@ static struct vy_stmt_iterator_iface vy_run_iterator_iface = {
 
 /* }}} vy_run_iterator API implementation */
 
-/**
- * Load run from disk
- * @param run - run to laod
- * @param index_path - path to index part of the run
- * @param run_path - path to run part of the run
- * @return - 0 on sucess, -1 on fail
+/*
+ * Open run index file
  */
-int
-vy_run_recover(struct vy_run *run, const char *index_path,
-	       const char *run_path)
+static int
+vy_run_index_open(struct vy_run *run, const char *index_path)
 {
 	struct xlog_cursor cursor;
 	if (xlog_cursor_open(&cursor, index_path))
@@ -1788,7 +1784,7 @@ vy_run_recover(struct vy_run *run, const char *index_path,
 		diag_set(ClientError, ER_INVALID_INDEX_FILE, index_path,
 			 tt_sprintf("Wrong xrow type (expected %d, got %u)",
 				    VY_INDEX_RUN_INFO, (unsigned)xrow.type));
-		return -1;
+		goto fail_close;
 	}
 	if (vy_run_info_decode(&run->info, &xrow, index_path) != 0)
 		goto fail_close;
@@ -1841,23 +1837,163 @@ vy_run_recover(struct vy_run *run, const char *index_path,
 
 	/* We don't need to keep metadata file open any longer. */
 	xlog_cursor_close(&cursor, false);
+	return 0;
 
+fail_close:
+	xlog_cursor_close(&cursor, false);
+fail:
+	vy_run_destroy(run);
+	return -1;
+}
+
+/*
+ * Extract key from record to store in page/run info
+ */
+static inline char *
+vy_extract_key(const struct xrow_header *xrow,
+	       const struct key_def *key_def)
+{
+	struct request request;
+	request_create(&request, xrow->type);
+	uint64_t key_map = request_key_map(xrow->type);
+	key_map &= ~(1ULL << IPROTO_SPACE_ID); /* space_id is optional */
+	if (request_decode(&request, xrow->body->iov_base, xrow->body->iov_len,
+			   key_map) < 0)
+		return NULL;
+	switch (request.type) {
+	case IPROTO_REPLACE:
+	case IPROTO_UPSERT:
+		return tuple_extract_key_raw(request.tuple,
+					     request.tuple_end,
+					     key_def, NULL);
+	case IPROTO_DELETE: {
+		char *key = region_alloc(&fiber()->gc,
+					       request.key_end - request.key);
+		if (key == NULL) {
+			diag_set(OutOfMemory, request.key_end - request.key,
+				 "region gc", "key");
+			return NULL;
+		}
+		memcpy(key, request.key, request.key_end - request.key);
+		return key;
+	}
+	}
+	diag_set(ClientError, ER_INVALID_RUN_FILE,
+		 tt_sprintf("Can't decode statement: "
+			    "unknown request type %u",
+			    (unsigned)request.type));
+	return NULL;
+}
+
+/*
+ * Rebuild run/page info from data
+ */
+static int
+vy_run_index_recover(struct vy_run *run, const char *index_path,
+		     struct xlog_cursor *data, const struct key_def *key_def)
+{
+	(void) index_path;
+	struct vy_page_info *page_infos;
+	int rc = 0;
+	off_t page_offset = xlog_cursor_pos(data);
+	const char *last_key = NULL;
+	struct region *region = &fiber()->gc;
+	size_t mem_used = region_used(region);
+	while ((rc = xlog_cursor_next_tx(data)) == 0) {
+		region_truncate(region, mem_used);
+		page_infos = (struct vy_page_info *)
+			realloc(run->info.page_infos,
+				sizeof(*page_infos) * (run->info.count + 1));
+		if (page_infos == NULL) {
+			diag_set(OutOfMemory, sizeof(struct vy_page_info),
+				 "malloc", "struct vy_page_info");
+			return -1;
+		}
+		run->info.page_infos = page_infos;
+		struct vy_page_info *info;
+		info = run->info.page_infos + run->info.count;
+		memset(info, 0, sizeof(*info));
+		info->offset = page_offset;
+		info->size = xlog_cursor_pos(data) - page_offset;
+		page_offset = xlog_cursor_pos(data);
+
+		uint64_t row_offset = xlog_cursor_tx_pos(data);
+		struct xrow_header xrow;
+		while ((rc = xlog_cursor_next_row(data, &xrow)) == 0) {
+			if (xrow.type == VY_RUN_PAGE_INDEX) {
+				/* last row with page index */
+				info->page_index_offset = row_offset;
+				break;
+			}
+			++info->count;
+			/* extract last key */
+			last_key = vy_extract_key(&xrow, key_def);
+			if (last_key == NULL)
+				return -1;
+			if (run->info.min_key == NULL) {
+				run->info.min_key = vy_key_dup(last_key);
+				if (run->info.min_key == NULL) {
+					/* destroy pending page info */
+					vy_page_info_destroy(info);
+					return -1;
+				}
+			}
+			if (info->min_key == NULL) {
+				info->min_key = vy_key_dup(last_key);
+				if (info->min_key == NULL) {
+					/* destroy pending page info */
+					vy_page_info_destroy(info);
+					return -1;
+				}
+			}
+			row_offset = xlog_cursor_tx_pos(data);
+		}
+		info->unpacked_size = xlog_cursor_tx_pos(data);
+		++run->info.count;
+		mem_used = region_used(region);
+	}
+	if (last_key != NULL) {
+		run->info.max_key = vy_key_dup(last_key);
+		if (run->info.max_key == NULL)
+			return -1;
+	}
+	run->info.has_bloom = 0;
+	region_truncate(region, mem_used);
+	return vy_run_write_index(run, index_path);
+}
+
+/**
+ * Load run from disk
+ * @param run - run to laod
+ * @param index_path - path to index part of the run
+ * @param run_path - path to run part of the run
+ * @return - 0 on sucess, -1 on fail
+ */
+int
+vy_run_recover(struct vy_run *run, const char *index_path,
+	       const char *run_path, const struct key_def *key_def)
+{
+	struct xlog_cursor cursor;
 	/* Prepare data file for reading. */
 	if (xlog_cursor_open(&cursor, run_path))
-		goto fail;
-	meta = &cursor.meta;
+		return -1;
+	struct xlog_meta *meta = &cursor.meta;
 	if (strcmp(meta->filetype, XLOG_META_TYPE_RUN) != 0) {
 		diag_set(ClientError, ER_INVALID_XLOG_TYPE,
 			 XLOG_META_TYPE_RUN, meta->filetype);
-		goto fail_close;
+		xlog_cursor_close(&cursor, false);
+		return -1;
 	}
+
+	if (vy_run_index_open(run, index_path) != 0 &&
+	    (cfg_geti("force_recovery") == false ||
+	     vy_run_index_recover(run, index_path, &cursor, key_def) != 0)) {
+		xlog_cursor_close(&cursor, false);
+		return -1;
+	}
+
 	run->fd = cursor.fd;
 	xlog_cursor_close(&cursor, true);
 	return 0;
-
-	fail_close:
-	xlog_cursor_close(&cursor, false);
-	fail:
-	return -1;
 }
 

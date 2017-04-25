@@ -292,7 +292,7 @@ vy_run_delete(struct vy_run *run);
  */
 int
 vy_run_recover(struct vy_run *run, const char *index_path,
-	       const char *run_path);
+	       const char *run_path, const struct key_def *key_def);
 
 /**
  * Write run info to disk

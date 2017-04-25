@@ -2805,7 +2805,8 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		vy_run_snprint_path(run_path, sizeof(run_path),
 				    index->path, run->id, VY_FILE_RUN);
 		if (!record->is_empty &&
-		    vy_run_recover(run, index_path, run_path) != 0) {
+		    vy_run_recover(run, index_path, run_path,
+				   &index_def->key_def) != 0) {
 			vy_run_unref(run);
 			return -1;
 		}
@@ -9020,7 +9021,8 @@ vy_join_cb(const struct vy_log_record *record, void *arg)
 		char run_path[PATH_MAX];
 		vy_run_snprint_path(run_path, sizeof(run_path),
 				    ctx->index_path, run->id, VY_FILE_RUN);
-		if (vy_run_recover(run, index_path, run_path) != 0) {
+		if (vy_run_recover(run, index_path, run_path,
+				   record->key_def) != 0) {
 			rlist_del_entry(run, in_join);
 			vy_run_unref(run);
 			return -1;
