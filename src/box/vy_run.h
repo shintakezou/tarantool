@@ -294,6 +294,16 @@ int
 vy_run_recover(struct vy_run *run, const char *index_path,
 	       const char *run_path);
 
+/**
+ * Write run info to disk
+ * @param run run to write
+ * @param path path to index part of the run
+ * @retval 0 on success
+ * @retval -1 on error
+ */
+int
+vy_run_write_index(struct vy_run *run, const char *path);
+
 /** Increment a run's reference counter. */
 static inline void
 vy_run_ref(struct vy_run *run)
