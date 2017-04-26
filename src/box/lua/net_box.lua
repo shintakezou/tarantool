@@ -700,14 +700,24 @@ function remote_methods:_request(method, opts, ...)
     end
     local buffer = opts and opts.buffer
     local err, res
+    local lang = nil
+    if method == 'eval' then
+        lang = opts and opts.language and string.upper(opts.language) or 'LUA'
+        assert(lang == 'SQL' or lang == 'LUA')
+    end
     repeat
         local timeout = deadline and max(0, deadline - fiber_time())
         if self.state ~= 'active' then
             wait_state('active', timeout)
             timeout = deadline and max(0, deadline - fiber_time())
         end
-        err, res = perform_request(timeout, buffer, method,
-                                   self._schema_id, ...)
+        if lang then
+            err, res = perform_request(timeout, buffer, method,
+                                       self._schema_id, lang, ...)
+        else
+            err, res = perform_request(timeout, buffer, method,
+                                       self._schema_id, ...)
+        end
         if not err and buffer ~= nil then
             return res -- the length of xrow.body
         elseif not err then
@@ -775,6 +785,19 @@ function remote_methods:eval(code, args, opts)
     check_remote_arg(self, 'eval')
     check_eval_args(args)
     args = args or {}
+    if opts and opts.language then
+        local lang = opts.language
+        if type(lang) ~= 'string' then
+            error(string.format('language must be string, but got %s',
+                                type(lang)))
+        end
+        local lang_up = string.upper(lang)
+        if lang_up ~= 'SQL' and lang_up ~= 'LUA' then
+            error(string.format('eval language expected "lua" or "sql", '..
+                                'got %s', lang))
+        end
+        lang = lang_up
+    end
     local res = self:_request('eval', opts, code, args)
     if type(res) ~= 'table' then
         return res
@@ -910,7 +933,7 @@ function console_methods:eval(line, timeout)
     end
     if self.protocol == 'Binary' then
         local loader = 'return require("console").eval(...)'
-        err, res = pr(timeout, nil, 'eval', nil, loader, {line})
+        err, res = pr(timeout, nil, 'eval', nil, 'lua', loader, {line})
     else
         assert(self.protocol == 'Lua console')
         err, res = pr(timeout, nil, 'inject', nil, line..'$EOF$\n')

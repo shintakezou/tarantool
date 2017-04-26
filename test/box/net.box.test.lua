@@ -599,6 +599,11 @@ c:eval("echo(...)", nil, {buffer = ibuf})
 ibuf.rpos, result = msgpack.ibuf_decode(ibuf.rpos)
 result
 
+c:eval("echo(1, 2, 3)", nil, {language = 'lua'})
+c:eval("console.log('kek');", nil, {language = 'javascript'})
+c:eval("print('kek');", nil, {language = 'c++'})
+c:eval("select * from ...", {"_space"}, {language = 'sql'})
+
 -- unsupported methods
 c.space.test:get({1}, { buffer = ibuf})
 c.space.test.index.primary:min({}, { buffer = ibuf})

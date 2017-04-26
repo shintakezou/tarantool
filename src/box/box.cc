@@ -1090,9 +1090,28 @@ box_process_eval(struct request *request, struct obuf *out)
 	rmean_collect(rmean_box, IPROTO_EVAL, 1);
 	/* Check permissions */
 	access_check_universe(PRIV_X);
-	if (box_lua_eval(request, out) != 0) {
+	enum iproto_language lang = IPROTO_LANGUAGE_LUA;
+	if (request->ops != NULL) {
+		/* The language is specified. */
+		if (mp_typeof(*request->ops) != MP_UINT)
+			tnt_raise(ClientError, ER_INVALID_MSGPACK,
+				 "expected UINT language identifier option");
+		const char *pos = request->ops;
+		uint64_t lang64 = mp_decode_uint(&pos);
+		if (lang64 >= iproto_language_MAX)
+			tnt_raise(ClientError, ER_INVALID_LANGUAGE,
+				  "unknown language");
+		lang = (enum iproto_language) lang64;
+		if (lang != IPROTO_LANGUAGE_LUA && lang != IPROTO_LANGUAGE_SQL)
+			tnt_raise(ClientError, ER_INVALID_LANGUAGE,
+				  iproto_language_strs[lang]);
+	}
+	if (lang == IPROTO_LANGUAGE_LUA && box_lua_eval(request, out) != 0) {
 		txn_rollback();
 		diag_raise();
+	} else {
+		tnt_raise(ClientError, ER_UNSUPPORTED, "eval",
+			  "'sql' language");
 	}
 
 	if (in_txn()) {

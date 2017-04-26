@@ -112,7 +112,7 @@ struct errcode_record {
 	/* 57 */_(ER_NO_SUCH_ENGINE,		"Space engine '%s' does not exist") \
 	/* 58 */_(ER_RELOAD_CFG,		"Can't set option '%s' dynamically") \
 	/* 59 */_(ER_CFG,			"Incorrect value for option '%s': %s") \
-	/* 60 */_(ER_UNUSED60,			"") \
+	/* 60 */_(ER_INVALID_LANGUAGE,		"Invalid language specified: %s, expected 'lua' or 'sql'") \
 	/* 61 */_(ER_UNUSED61,			"") \
 	/* 62 */_(ER_UNKNOWN_REPLICA,		"Replica %s is not registered with replica set %s") \
 	/* 63 */_(ER_REPLICASET_UUID_MISMATCH,	"Replica set UUID of the replica %s doesn't match replica set UUID of the master %s") \

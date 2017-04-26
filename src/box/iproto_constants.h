@@ -53,6 +53,7 @@ enum {
 enum iproto_language {
 	IPROTO_LANGUAGE_LUA = 0,
 	IPROTO_LANGUAGE_C = 1,
+	IPROTO_LANGUAGE_SQL = 2,
 	iproto_language_MAX,
 };
 extern const char *iproto_language_strs[];
@@ -83,6 +84,7 @@ enum iproto_key {
 	IPROTO_VCLOCK = 0x26,
 	IPROTO_EXPR = 0x27, /* EVAL */
 	IPROTO_OPS = 0x28, /* UPSERT but not UPDATE ops, because of legacy */
+	IPROTO_LANGUAGE = 0x29,
 	/* Leave a gap between request keys and response keys */
 	IPROTO_DATA = 0x30,
 	IPROTO_ERROR = 0x31,
@@ -96,7 +98,7 @@ enum iproto_key {
 #define IPROTO_BODY_BMAP (bit(SPACE_ID) | bit(INDEX_ID) | bit(LIMIT) |\
 			  bit(OFFSET) | bit(ITERATOR) | bit(INDEX_BASE) |\
 			  bit(KEY) | bit(TUPLE) | bit(FUNCTION_NAME) | \
-			  bit(USER_NAME) | bit(EXPR) | bit(OPS))
+			  bit(USER_NAME) | bit(EXPR) | bit(OPS) | bit(LANGUAGE))
 
 static inline bool
 xrow_header_has_key(const char *pos, const char *end)

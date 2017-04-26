@@ -251,6 +251,7 @@ error:
 			request->key_end = data;
 			break;
 		case IPROTO_OPS:
+		case IPROTO_LANGUAGE:
 			request->ops = value;
 			request->ops_end = data;
 			break;

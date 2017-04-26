@@ -1564,6 +1564,23 @@ result
 ---
 - {48: []}
 ...
+c:eval("echo(1, 2, 3)", nil, {language = 'lua'})
+---
+...
+c:eval("console.log('kek');", nil, {language = 'javascript'})
+---
+- error: 'builtin/box/net_box.lua..."]:<line>: eval language expected "lua" or "sql", got
+    javascript'
+...
+c:eval("print('kek');", nil, {language = 'c++'})
+---
+- error: 'builtin/box/net_box.lua..."]:<line>: eval language expected "lua" or "sql", got
+    c++'
+...
+c:eval("select * from ...", {"_space"}, {language = 'sql'})
+---
+- error: eval does not support 'sql' language
+...
 -- unsupported methods
 c.space.test:get({1}, { buffer = ibuf})
 ---

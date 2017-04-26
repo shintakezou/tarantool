@@ -198,24 +198,35 @@ netbox_encode_call(lua_State *L)
 static int
 netbox_encode_eval(lua_State *L)
 {
-	if (lua_gettop(L) < 5)
+	if (lua_gettop(L) < 6)
 		return luaL_error(L, "Usage: netbox.encode_eval(ibuf, sync, "
-		       "schema_id, expr, args)");
+		       "schema_id, language, expr, args)");
 
 	struct mpstream stream;
 	size_t svp = netbox_prepare_request(L, &stream, IPROTO_EVAL);
 
-	luamp_encode_map(cfg, &stream, 2);
+
+	luamp_encode_map(cfg, &stream, 3);
+
+	/* encode language as part of ops array */
+	size_t language_len;
+	const char *language = lua_tolstring(L, 4, &language_len);
+	assert(language_len > 0);
+	enum iproto_language lang = STR2ENUM(iproto_language, language);
+	assert(lang == IPROTO_LANGUAGE_SQL || lang == IPROTO_LANGUAGE_LUA);
+	luamp_encode_uint(cfg, &stream, IPROTO_LANGUAGE);
+	luamp_encode_uint(cfg, &stream, lang);
 
 	/* encode expr */
 	size_t expr_len;
-	const char *expr = lua_tolstring(L, 4, &expr_len);
+	const char *expr = lua_tolstring(L, 5, &expr_len);
 	luamp_encode_uint(cfg, &stream, IPROTO_EXPR);
 	luamp_encode_str(cfg, &stream, expr, expr_len);
 
 	/* encode args */
 	luamp_encode_uint(cfg, &stream, IPROTO_TUPLE);
-	luamp_encode_tuple(L, cfg, &stream, 5);
+	luamp_encode_tuple(L, cfg, &stream, 6);
+
 
 	netbox_encode_request(&stream, svp);
 	return 0;

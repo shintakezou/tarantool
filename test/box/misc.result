@@ -307,6 +307,7 @@ t;
   - 'box.error.CHECKPOINT_IN_PROGRESS : 120'
   - 'box.error.FIELD_TYPE : 23'
   - 'box.error.UNKNOWN_UPDATE_OP : 28'
+  - 'box.error.INVALID_LANGUAGE : 60'
   - 'box.error.TUPLE_REF_OVERFLOW : 86'
   - 'box.error.INVALID_XLOG_NAME : 75'
   - 'box.error.NO_SUCH_FUNCTION : 51'
