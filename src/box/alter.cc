@@ -1736,14 +1736,15 @@ func_def_create_from_tuple(struct func_def *def, struct tuple *tuple)
 		def->setuid = false;
 	if (tuple_field_count(tuple) > FUNC_LANGUAGE) {
 		const char *language = tuple_field_cstr_xc(tuple, FUNC_LANGUAGE);
-		def->language = STR2ENUM(func_language, language);
-		if (def->language == func_language_MAX) {
+		def->language = STR2ENUM(iproto_language, language);
+		if (def->language != IPROTO_LANGUAGE_LUA &&
+		    def->language != IPROTO_LANGUAGE_C) {
 			tnt_raise(ClientError, ER_FUNCTION_LANGUAGE,
 				  language, name);
 		}
 	} else {
 		/* Lua is the default. */
-		def->language = FUNC_LANGUAGE_LUA;
+		def->language = IPROTO_LANGUAGE_LUA;
 	}
 }
 

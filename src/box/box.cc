@@ -951,7 +951,7 @@ access_check_func(const char *name, uint32_t name_len)
 int
 func_call(struct func *func, struct request *request, struct obuf *out)
 {
-	assert(func != NULL && func->def.language == FUNC_LANGUAGE_C);
+	assert(func != NULL && func->def.language == IPROTO_LANGUAGE_C);
 	if (func->func == NULL)
 		func_load(func);
 
@@ -1060,7 +1060,7 @@ box_process_call(struct request *request, struct obuf *out)
 	}
 
 	int rc;
-	if (func && func->def.language == FUNC_LANGUAGE_C) {
+	if (func && func->def.language == IPROTO_LANGUAGE_C) {
 		rc = func_call(func, request, out);
 	} else {
 		rc = box_lua_call(request, out);

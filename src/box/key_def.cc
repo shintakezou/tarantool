@@ -89,8 +89,6 @@ const char *index_type_strs[] = { "HASH", "TREE", "BITSET", "RTREE" };
 
 const char *rtree_index_distance_type_strs[] = { "EUCLID", "MANHATTAN" };
 
-const char *func_language_strs[] = {"LUA", "C"};
-
 const uint32_t key_mp_type[] = {
 	/* [FIELD_TYPE_ANY]      =  */ UINT32_MAX,
 	/* [FIELD_TYPE_UNSIGNED] =  */ 1U << MP_UINT,

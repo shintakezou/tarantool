@@ -49,6 +49,14 @@ enum {
 	XLOG_FIXHEADER_SIZE = 19
 };
 
+/** The supported languages for eval and stored functions. */
+enum iproto_language {
+	IPROTO_LANGUAGE_LUA = 0,
+	IPROTO_LANGUAGE_C = 1,
+	iproto_language_MAX,
+};
+extern const char *iproto_language_strs[];
+
 enum iproto_key {
 	IPROTO_REQUEST_TYPE = 0x00,
 	IPROTO_SYNC = 0x01,

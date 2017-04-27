@@ -30,6 +30,8 @@
  */
 #include "iproto_constants.h"
 
+const char *iproto_language_strs[] = {"LUA", "C"};
+
 const unsigned char iproto_key_type[IPROTO_KEY_MAX] =
 {
 	/* {{{ header */

@@ -40,6 +40,7 @@
 #include <limits.h>
 #include <wchar.h>
 #include <wctype.h>
+#include "iproto_constants.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -106,16 +107,6 @@ extern const char *field_type_strs[];
 
 /* MsgPack type names */
 extern const char *mp_type_strs[];
-
-/**
- * The supported language of the stored function.
- */
-enum func_language {
-	FUNC_LANGUAGE_LUA,
-	FUNC_LANGUAGE_C,
-	func_language_MAX,
-};
-extern const char *func_language_strs[];
 
 static inline uint32_t
 field_type_maxlen(enum field_type type)
@@ -358,7 +349,7 @@ struct func_def {
 	/**
 	 * The language of the stored function.
 	 */
-	enum func_language language;
+	enum iproto_language language;
 	/** Function name. */
 	char name[BOX_NAME_MAX + 1];
 };
