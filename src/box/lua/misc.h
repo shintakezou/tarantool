@@ -38,9 +38,13 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct lua_State;
+struct port;
 
 char *
 lbox_encode_tuple_on_gc(struct lua_State *L, int idx, size_t *p_len);
+
+void
+lbox_port_to_table(struct lua_State *L, struct port *port);
 
 void
 box_lua_misc_init(struct lua_State *L);

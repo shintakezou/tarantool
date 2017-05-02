@@ -59,7 +59,7 @@ lbox_encode_tuple_on_gc(lua_State *L, int idx, size_t *p_len)
 
 /** {{{ Lua/C implementation of index:select(): used only by Vinyl **/
 
-static inline void
+void
 lbox_port_to_table(lua_State *L, struct port *port)
 {
 	lua_createtable(L, port->size, 0);

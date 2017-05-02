@@ -1,0 +1,74 @@
+test_run = require('test_run').new()
+---
+...
+box.sql.execute("CREATE TABLE test1(id primary key);");
+---
+...
+box.sql.execute("CREATE TABLE test2(id primary key);");
+---
+...
+space1 = box.space.test1
+---
+...
+space2 = box.space.test2
+---
+...
+assert(space1 ~= nil)
+---
+- true
+...
+assert(space2 ~= nil)
+---
+- true
+...
+space1:replace({1})
+---
+- [1]
+...
+space2:replace({2})
+---
+- [2]
+...
+box.sql.execute('SELECT * FROM test1;')
+---
+- - [1]
+...
+box.sql.execute('SELECT * FROM test2;')
+---
+- - [2]
+...
+test_run:cmd("setopt delimiter ';'")
+---
+- true
+...
+box.sql.execute('    SELECT * FROM test1;            ');
+---
+- - [1]
+...
+test_run:cmd("setopt delimiter ''");
+---
+- true
+...
+box.sql.execute('SELECT * FROM test1; SELECT * FROM test2')
+---
+- error: SQL expression must contain single query and either nothing or ';' at the
+    end
+...
+box.sql.execute('SELECT * FROM test1, test2; blah blah invalid query')
+---
+- error: 'near "blah": syntax error'
+...
+box.sql.execute('DROP TABLE test1')
+---
+...
+box.sql.execute('DROP TABLE test2')
+---
+...
+assert(box.space.test1 == nil)
+---
+- true
+...
+assert(box.space.test2 == nil)
+---
+- true
+...

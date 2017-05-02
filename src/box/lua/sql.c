@@ -1,136 +1,22 @@
 #include "sql.h"
 #include "box/sql.h"
+#include "trivia/util.h"
+#include "fiber.h"
+#include "small/region.h"
+#include "box/memtx_tuple.h"
+#include "box/port.h"
 
 #include "sqlite3.h"
+#include "box/lua/misc.h"
 #include "lua/utils.h"
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
 
-struct prep_stmt
+void
+lua_push_column_names(struct lua_State *L, sqlite3_stmt *stmt)
 {
-	sqlite3_stmt *stmt;
-};
-
-struct prep_stmt_list
-{
-	uint8_t         *mem_end;   /* denotes actual size of sql_ctx struct */
-	uint32_t         pool_size; /* mem at the end used for aux allocations;
-				       pool grows from mem_end
-				       towards stmt[] array */
-	uint32_t         last_select_stmt_index; /* UINT32_MAX if no selects */
-	uint32_t         column_count; /* in last select stmt */
-	uint32_t         stmt_count;
-	struct prep_stmt stmt[6];  /* overlayed with the mem pool;
-				      actual size could be larger or smaller */
-	/* uint8_t mem_pool[] */
-};
-
-static inline int
-prep_stmt_list_needs_free(struct prep_stmt_list *l)
-{
-	return (uint8_t *)(l + 1) != l->mem_end;
-}
-
-/* Release resources and free the list itself, unless it was preallocated
- * (i.e. l points to an automatic variable) */
-static void
-prep_stmt_list_free(struct prep_stmt_list *l)
-{
-	if (l == NULL)
-		return;
-	for (size_t i = 0, n = l->stmt_count; i < n; i++)
-		sqlite3_finalize(l->stmt[i].stmt);
-	if (prep_stmt_list_needs_free(l))
-		free(l);
-}
-
-static struct prep_stmt_list *
-prep_stmt_list_init(struct prep_stmt_list *prealloc)
-{
-	prealloc->mem_end = (uint8_t *)(prealloc + 1);
-	prealloc->pool_size = 0;
-	prealloc->last_select_stmt_index = UINT32_MAX;
-	prealloc->column_count = 0;
-	prealloc->stmt_count = 0;
-	return prealloc;
-}
-
-/* Allocate mem from the prep_stmt_list pool.
- * If not enough space is available, reallocates the list.
- * If reallocation is needed but l was preallocated, old mem is left
- * intact and a new memory chunk is allocated. */
-static void *
-prep_stmt_list_palloc(struct prep_stmt_list **pl,
-		      size_t size, size_t alignment)
-{
-	assert((alignment & (alignment - 1)) == 0); /* 2 ^ k */
-	assert(alignment <= __alignof__((*pl)->stmt[0]));
-
-	struct prep_stmt_list *l = *pl;
-	uint32_t pool_size = l->pool_size;
-	uint32_t pool_size_max = (uint32_t)(
-		l->mem_end - (uint8_t *)(l->stmt + l->stmt_count)
-	);
-
-	assert(UINT32_MAX - pool_size >= size);
-	pool_size += size;
-
-	assert(UINT32_MAX - pool_size >= alignment - 1);
-	pool_size += alignment - 1;
-	pool_size &= ~(alignment - 1);
-
-	if (pool_size > pool_size_max) {
-		size_t prev_size = l->mem_end - (uint8_t *)l;
-		size_t size = prev_size;
-		while (size < prev_size + (pool_size - pool_size_max)) {
-			assert(SIZE_MAX - size >= size);
-			size += size;
-		}
-		if (prep_stmt_list_needs_free(l)) {
-			l = realloc(l, size);
-			if (l == NULL)
-				return NULL;
-		} else {
-			l = malloc(size);
-			if (l == NULL)
-				return NULL;
-			memcpy(l, *pl, prev_size);
-		}
-		l->mem_end = (uint8_t *)l + size;
-		/* move the pool data */
-		memmove((uint8_t *)l + prev_size - l->pool_size,
-			l->mem_end - l->pool_size,
-			l->pool_size);
-		*pl = l;
-	}
-
-	l->pool_size = pool_size;
-	return l->mem_end - pool_size;
-}
-
-/* push new stmt; reallocate memory if needed
- * returns a pointer to the new stmt or NULL if out of memory.
- * If reallocation is needed but l was preallocated, old mem is left
- * intact and a new memory chunk is allocated. */
-static struct prep_stmt *
-prep_stmt_list_push(struct prep_stmt_list **pl)
-{
-	struct prep_stmt_list *l;
-	/* make sure we don't collide with the pool */
-	if (prep_stmt_list_palloc(pl, sizeof(l->stmt[0]), 1
-				  ) == NULL)
-		return NULL;
-	l = *pl;
-	l->pool_size -= sizeof(l->stmt[0]);
-	return l->stmt + (l->stmt_count++);
-}
-
-static void
-lua_push_column_names(struct lua_State *L, struct prep_stmt_list *l)
-{
-	sqlite3_stmt *stmt = l->stmt[l->last_select_stmt_index].stmt;
-	int n = l->column_count;
+	int n = sqlite3_column_count(stmt);
 	lua_createtable(L, n, 0);
 	for (int i = 0; i < n; i++) {
 		const char *name = sqlite3_column_name(stmt, i);
@@ -139,68 +25,166 @@ lua_push_column_names(struct lua_State *L, struct prep_stmt_list *l)
 	}
 }
 
-static void
-lua_push_row(struct lua_State *L, struct prep_stmt_list *l)
+struct tuple *
+sql_row_to_tuple(sqlite3_stmt *stmt)
 {
-	sqlite3_stmt *stmt = l->stmt[l->last_select_stmt_index].stmt;
-	int column_count = l->column_count;
-	char *typestr = (void *)(l->mem_end - column_count);
+	int column_count = sqlite3_column_count(stmt);
+	assert(column_count > 0);
 
-	lua_createtable(L, column_count, 0);
-	lua_rawgeti(L, LUA_REGISTRYINDEX, luaL_array_metatable_ref);
-	lua_setmetatable(L, -2);
-
-	for (int i = 0; i < column_count; i++) {
+	/* Calculate size. */
+	uint32_t mp_size = mp_sizeof_array(column_count);
+	for (int i = 0; i < column_count; ++i) {
 		int type = sqlite3_column_type(stmt, i);
 		switch (type) {
-		case SQLITE_INTEGER:
-			typestr[i] = 'i';
-			lua_pushinteger(L, sqlite3_column_int(stmt, i));
+		case SQLITE_INTEGER: {
+			int n = sqlite3_column_int(stmt, i);
+			if (n >= 0)
+				mp_size += mp_sizeof_uint(n);
+			else
+				mp_size += mp_sizeof_int(n);
 			break;
-		case SQLITE_FLOAT:
-			typestr[i] = 'f';
-			lua_pushnumber(L, sqlite3_column_double(stmt, i));
+		}
+		case SQLITE_FLOAT: {
+			double d = sqlite3_column_double(stmt, i);
+			mp_size += mp_sizeof_double(d);
 			break;
+		}
+		case SQLITE_TEXT:
+			mp_size += mp_sizeof_str(sqlite3_column_bytes(stmt, i));
+			break;
+		case SQLITE_BLOB:
+			mp_size += mp_sizeof_bin(sqlite3_column_bytes(stmt, i));
+			break;
+		case SQLITE_NULL:
+			mp_size += mp_sizeof_nil();
+			break;
+		default:
+			unreachable();
+		}
+	}
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+	char *mp_data = region_alloc(region, mp_size);
+	char *pos = mp_data;
+	if (mp_data == NULL)
+		return NULL;
+
+	/* Encode tuple data. */
+	pos = mp_encode_array(pos, column_count);
+	for (int i = 0; i < column_count; ++i) {
+		int type = sqlite3_column_type(stmt, i);
+		switch (type) {
+		case SQLITE_INTEGER: {
+			int n = sqlite3_column_int(stmt, i);
+			if (n >= 0)
+				pos = mp_encode_uint(pos, n);
+			else
+				pos = mp_encode_int(pos, n);
+			break;
+		}
+		case SQLITE_FLOAT: {
+			double d = sqlite3_column_double(stmt, i);
+			pos = mp_encode_double(pos, d);
+			break;
+		}
 		case SQLITE_TEXT: {
-			const void *text = sqlite3_column_text(stmt, i);
-			typestr[i] = 's';
-			lua_pushlstring(L, text,
-					sqlite3_column_bytes(stmt, i));
+			uint32_t len = sqlite3_column_bytes(stmt, i);
+			const char *text =
+				(const char *) sqlite3_column_text(stmt, i);
+			pos = mp_encode_str(pos, text, len);
 			break;
 		}
 		case SQLITE_BLOB: {
-			const void *blob = sqlite3_column_blob(stmt, i);
-			typestr[i] = 'b';
-			lua_pushlstring(L, blob,
-					sqlite3_column_bytes(stmt, i));
+			uint32_t len = sqlite3_column_bytes(stmt, i);
+			const void *bin = sqlite3_column_blob(stmt, i);
+			pos = mp_encode_bin(pos, bin, len);
 			break;
 		}
 		case SQLITE_NULL:
-			typestr[i] = '-';
-			lua_rawgeti(L, LUA_REGISTRYINDEX, luaL_nil_ref);
+			pos = mp_encode_nil(pos);
 			break;
 		default:
-			typestr[i] = '?';
-			assert(0);
+			unreachable();
 		}
-		lua_rawseti(L, -2, i+1);
+	}
+	assert(mp_data + mp_size == pos);
+
+	struct tuple *res = memtx_tuple_new(tuple_format_default, mp_data, pos);
+	region_truncate(region, region_svp);
+	return res;
+}
+
+static int
+box_sql_execute(struct port *port, const char *sql, const char *sql_end,
+		bool *no_columns)
+{
+	int rc;
+	sqlite3 *db = sql_get();
+	*no_columns = true;
+
+	if (db == NULL) {
+		diag_set(ClientError, ER_SQL, "sqlite is not ready");
+		return -1;
+	}
+	assert(sql_end - sql <= INT_MAX);
+	sqlite3_stmt *stmt;
+	rc = sqlite3_prepare_v2(db, sql, (int)(sql_end - sql), &stmt, &sql);
+	if (rc != SQLITE_OK)
+		goto sqlerror;
+	if (sql != sql_end) {
+		/*
+		 * Check if the rest of the query contains only
+		 * whitespaces. Make check in prepare_v2, because
+		 * only sqlite has necessary information about
+		 * current locale whitespaces.
+		 */
+		sqlite3_stmt *rest;
+		rc = sqlite3_prepare_v2(db, sql, (int)(sql_end - sql), &rest,
+					&sql);
+		if (rc != SQLITE_OK)
+			goto sqlerror;
+		sqlite3_finalize(rest);
+		if (rest != NULL) {
+			diag_set(ClientError, ER_SQL, "SQL expression must contain "\
+				 "single query and either nothing or ';' at the end");
+			return -1;
+		}
+		assert(sql == sql_end);
 	}
 
-	lua_pushlstring(L, typestr, column_count);
-	lua_rawseti(L, -2, 0);
+	if (stmt == NULL) {
+		/* only whitespace */
+		assert(sql == sql_end);
+		return 0;
+	}
+
+	if (sqlite3_column_count(stmt) == 0) {
+		while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) { ; }
+	} else {
+		*no_columns = false;
+		while ((rc = sqlite3_step(stmt) == SQLITE_ROW)) {
+			struct tuple *tuple = sql_row_to_tuple(stmt);
+			if (tuple == NULL || port_add_tuple(port, tuple) != 0)
+				goto err;
+		}
+	}
+	if (rc != SQLITE_OK && rc != SQLITE_DONE)
+		goto sqlerror;
+	sqlite3_finalize(stmt);
+	return 0;
+sqlerror:
+	diag_set(ClientError, ER_SQL, sqlite3_errmsg(db));
+err:
+	if (stmt != NULL)
+		sqlite3_finalize(stmt);
+	return -1;
 }
 
 static int
 lua_sql_execute(struct lua_State *L)
 {
-	int rc;
-	sqlite3 *db = sql_get();
-	struct prep_stmt_list *l = NULL, stock_l;
 	size_t length;
 	const char *sql, *sql_end;
-
-	if (db == NULL)
-		return luaL_error(L, "not ready");
 
 	sql = lua_tolstring(L, 1, &length);
 	if (sql == NULL)
@@ -209,70 +193,17 @@ lua_sql_execute(struct lua_State *L)
 	assert(length <= INT_MAX);
 	sql_end = sql + length;
 
-	l = prep_stmt_list_init(&stock_l);
-	while (sql != sql_end) {
-
-		struct prep_stmt *ps = prep_stmt_list_push(&l);
-		if (ps == NULL)
-			goto outofmem;
-		rc = sqlite3_prepare_v2(db, sql, (int)(sql_end - sql),
-					&ps->stmt, &sql);
-		if (rc != SQLITE_OK)
-			goto sqlerror;
-
-		if (ps->stmt == NULL) {
-			/* only whitespace */
-			assert(sql == sql_end);
-			l->stmt_count --;
-			break;
-		}
-
-		int column_count = sqlite3_column_count(ps->stmt);
-		if (column_count == 0) {
-			while ((rc = sqlite3_step(ps->stmt)) == SQLITE_ROW) { ; }
-			if (rc != SQLITE_OK && rc != SQLITE_DONE)
-				goto sqlerror;
-		} else {
-			char *typestr;
-			l->column_count = column_count;
-			l->last_select_stmt_index = l->stmt_count - 1;
-
-			assert(l->pool_size == 0);
-			typestr = prep_stmt_list_palloc(&l, column_count, 1);
-			if (typestr == NULL)
-				goto outofmem;
-
-			lua_settop(L, 1); /* discard any results */
-
-			/* create result table */
-			lua_createtable(L, 7, 0);
-			lua_pushvalue(L, lua_upvalueindex(1));
-			lua_setmetatable(L, -2);
-			lua_push_column_names(L, l);
-			lua_rawseti(L, -2, 0);
-
-			int row_count = 0;
-			while ((rc = sqlite3_step(ps->stmt) == SQLITE_ROW)) {
-				lua_push_row(L, l);
-				row_count++;
-				lua_rawseti(L, -2, row_count);
-			}
-
-			if (rc != SQLITE_OK)
-				goto sqlerror;
-
-			l->pool_size = 0;
-		}
+	struct port port;
+	port_create(&port);
+	bool no_columns;
+	if (box_sql_execute(&port, sql, sql_end, &no_columns) != 0) {
+		port_destroy(&port);
+		return luaT_error(L);
 	}
-	prep_stmt_list_free(l);
-	return lua_gettop(L) - 1;
-sqlerror:
-	prep_stmt_list_free(l);
-	lua_pushstring(L, sqlite3_errmsg(db));
-	return lua_error(L);
-outofmem:
-	prep_stmt_list_free(l);
-	return luaL_error(L, "out of memory");
+	if (!no_columns)
+		lbox_port_to_table(L, &port);
+	port_destroy(&port);
+	return no_columns ? 0 : 1;
 }
 
 void
