@@ -744,7 +744,7 @@ struct vy_tx {
 	 */
 	struct vy_read_view *read_view;
 	/**
-	 * Prepare sequence number. 
+	 * Prepare sequence number.
 	 * Is -1 if the transaction is not prepared.
 	 */
 	int64_t psn;
@@ -5714,48 +5714,43 @@ txv_delete(struct txv *v)
 	mempool_free(&v->tx->xm->txv_mempool, v);
 }
 
-static struct txv *
-read_set_delete_cb(read_set_t *t, struct txv *v, void *arg)
-{
-	(void) t;
-	(void) arg;
-	txv_delete(v);
-	return NULL;
-}
-
-static struct vy_range *
-vy_range_tree_free_cb(vy_range_tree_t *t, struct vy_range *range, void *arg)
-{
-	(void)t;
-	struct vy_index *index = (struct vy_index *) arg;
-	struct vy_scheduler *scheduler = index->env->scheduler;
-
-	/*
-	 * Exempt the range along with all its in-memory indexes
-	 * from the scheduler.
-	 */
-	if (range->mem != NULL)
-		vy_scheduler_mem_dumped(scheduler, range->mem);
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &range->sealed, in_sealed)
-		vy_scheduler_mem_dumped(scheduler, mem);
-	if (range->in_dump.pos != UINT32_MAX) {
-		/*
-		 * The range could have already been removed
-		 * by vy_schedule().
-		 */
-		vy_scheduler_remove_range(scheduler, range);
-	}
-
-	vy_range_delete(range);
-	return NULL;
-}
 
 static void
 vy_index_delete(struct vy_index *index)
 {
-	read_set_iter(&index->read_set, NULL, read_set_delete_cb, NULL);
-	vy_range_tree_iter(&index->tree, NULL, vy_range_tree_free_cb, index);
+	read_set_rb_iterator it_rs;
+	it_rs.is_forward = true;
+	read_set_ifirst(&index->read_set, &it_rs);
+	struct txv *tx = read_set_inext(&index->read_set, &it_rs);
+	while (tx) {
+		txv_delete(tx);
+		tx = read_set_inext(&index->read_set, &it_rs);
+	}
+	vy_range_tree_rb_iterator it_vr;
+	it_vr.is_forward = true;
+	vy_range_tree_ifirst(&index->tree, &it_vr);
+	struct vy_range *range = vy_range_tree_inext(&index->tree, &it_vr);
+	struct vy_scheduler *scheduler = index->env->scheduler;
+	while (range) {
+		/*
+		 * Exempt the range along with all its in-memory indexes
+		 * from the scheduler.
+		 */
+		if (range->mem != NULL)
+			vy_scheduler_mem_dumped(scheduler, range->mem);
+		struct vy_mem *mem;
+		rlist_foreach_entry(mem, &range->sealed, in_sealed)
+			vy_scheduler_mem_dumped(scheduler, mem);
+		if (range->in_dump.pos != UINT32_MAX) {
+			/*
+			 * The range could have already been removed
+			 * by vy_schedule().
+			 */
+			vy_scheduler_remove_range(scheduler, range);
+		}
+		vy_range_delete(range);
+		range = vy_range_tree_inext(&index->tree, &it_vr);
+	}
 	free(index->name);
 	free(index->path);
 	tuple_format_ref(index->surrogate_format, -1);

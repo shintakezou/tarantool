@@ -810,7 +810,15 @@ rtree_iterator_reset_cb(rtnt_t *t, struct rtree_neighbor *n, void *d)
 static void
 rtree_iterator_reset(struct rtree_iterator *itr)
 {
-	rtnt_iter(&itr->neigh_tree, 0, rtree_iterator_reset_cb, (void *)itr);
+	rtnt_rb_iterator rb_it;
+	rb_it.is_forward = true;
+	rtnt_ifirst(&itr->neigh_tree, &rb_it);
+	struct rtree_neighbor *n = rtnt_inext(&itr->neigh_tree, &rb_it);
+	while (n) {
+		n->next = itr->neigh_free_list;
+		itr->neigh_free_list = n;
+		n = rtnt_inext(&itr->neigh_tree, &rb_it);
+	}
 	rtnt_new(&itr->neigh_tree);
 }
 
