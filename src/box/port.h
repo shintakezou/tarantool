@@ -81,8 +81,11 @@ port_destroy(struct port *port);
 void
 port_dump(struct port *port, struct obuf *out);
 
-void
+int
 port_add_tuple(struct port *port, struct tuple *tuple);
+
+void
+port_add_tuple_xc(struct port *port, struct tuple *tuple);
 
 void
 port_init(void);

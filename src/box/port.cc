@@ -37,7 +37,7 @@
 static struct mempool port_entry_pool;
 
 void
-port_add_tuple(struct port *port, struct tuple *tuple)
+port_add_tuple_xc(struct port *port, struct tuple *tuple)
 {
 	struct port_entry *e;
 	if (port->size == 0) {
@@ -59,6 +59,32 @@ port_add_tuple(struct port *port, struct tuple *tuple)
 	e->tuple = tuple;
 	e->next = NULL;
 	++port->size;
+}
+
+int
+port_add_tuple(struct port *port, struct tuple *tuple)
+{
+	struct port_entry *e;
+	if (port->size == 0) {
+		if (tuple_ref(tuple) != 0)
+			return -1;
+		e = &port->first_entry;
+		port->first = port->last = e;
+	} else {
+		e = (struct port_entry *) mempool_alloc(&port_entry_pool);
+		if (e == NULL)
+			return -1;
+		if (tuple_ref(tuple) != 0) {
+			mempool_free(&port_entry_pool, e);
+			return -1;
+		}
+		port->last->next = e;
+		port->last = e;
+	}
+	e->tuple = tuple;
+	e->next = NULL;
+	++port->size;
+	return 0;
 }
 
 void
