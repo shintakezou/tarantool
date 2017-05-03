@@ -114,7 +114,7 @@ sql_row_to_tuple(sqlite3_stmt *stmt)
 	return res;
 }
 
-static int
+int
 box_sql_execute(struct port *port, const char *sql, const char *sql_end,
 		bool *no_columns)
 {

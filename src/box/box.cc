@@ -1105,8 +1105,37 @@ box_process_eval(struct request *request, struct obuf *out)
 		txn_rollback();
 		diag_raise();
 	} else {
-		tnt_raise(ClientError, ER_UNSUPPORTED, "eval",
-			  "'sql' language");
+		struct port port;
+		port_create(&port);
+		bool no_columns;
+		const char *sql = request->key;
+		struct obuf_svp svp;
+		assert(mp_typeof(*sql) == MP_STR);
+		uint32_t len;
+		sql = mp_decode_str(&sql, &len);
+		assert(len + sql == request->key_end);
+		if (box_sql_execute(&port, sql, request->key_end,
+				    &no_columns) != 0) {
+			port_destroy(&port);
+			diag_raise();
+		}
+		if (! no_columns) {
+			if (iproto_prepare_select(out, &svp) != 0) {
+				port_destroy(&port);
+				diag_raise();
+			}
+			try {
+				port_dump(&port, out);
+			} catch (Exception *e) {
+				port_destroy(&port);
+				throw;
+			}
+			iproto_reply_select(out, &svp, request->header->sync,
+					    port.size);
+		} else {
+			port_destroy(&port);
+			iproto_reply_ok(out, request->header->sync);
+		}
 	}
 
 	if (in_txn()) {

@@ -172,6 +172,10 @@ box_select(struct port *port, uint32_t space_id, uint32_t index_id,
 	   int iterator, uint32_t offset, uint32_t limit,
 	   const char *key, const char *key_end);
 
+int
+box_sql_execute(struct port *port, const char *sql, const char *sql_end,
+		bool *no_columns);
+
 /** \cond public */
 
 /*

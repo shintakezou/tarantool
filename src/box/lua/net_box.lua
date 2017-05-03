@@ -721,8 +721,11 @@ function remote_methods:_request(method, opts, ...)
         if not err and buffer ~= nil then
             return res -- the length of xrow.body
         elseif not err then
-            setmetatable(res, sequence_mt)
-            local postproc = method ~= 'eval' and method ~= 'call_17'
+            local postproc = (method ~= 'eval' and method ~= 'call_17') or
+                             (method == 'eval' and lang == 'SQL' and res ~= nil)
+            if res ~= nil then
+                setmetatable(res, sequence_mt)
+            end
             if postproc and rawget(box, 'tuple') then
                 local tnew = box.tuple.new
                 for i, v in pairs(res) do
@@ -785,8 +788,9 @@ function remote_methods:eval(code, args, opts)
     check_remote_arg(self, 'eval')
     check_eval_args(args)
     args = args or {}
+    local lang = 'LUA'
     if opts and opts.language then
-        local lang = opts.language
+        lang = opts.language
         if type(lang) ~= 'string' then
             error(string.format('language must be string, but got %s',
                                 type(lang)))
@@ -799,7 +803,10 @@ function remote_methods:eval(code, args, opts)
         lang = lang_up
     end
     local res = self:_request('eval', opts, code, args)
-    if type(res) ~= 'table' then
+    if res == nil then
+        res = true
+    end
+    if type(res) ~= 'table' or lang == 'SQL' then
         return res
     end
     return unpack(res)

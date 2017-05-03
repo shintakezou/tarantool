@@ -602,7 +602,10 @@ result
 c:eval("echo(1, 2, 3)", nil, {language = 'lua'})
 c:eval("console.log('kek');", nil, {language = 'javascript'})
 c:eval("print('kek');", nil, {language = 'c++'})
-c:eval("select * from ...", {"_space"}, {language = 'sql'})
+c:eval("select name, owner from _space", nil, {language = 'sql'})
+box.sql.execute('create table sqltable(id primary key)')
+c:eval("insert into sqltable values (1)", nil, {language = 'sql'})
+box.sql.execute('drop table sqltable')
 
 -- unsupported methods
 c.space.test:get({1}, { buffer = ibuf})

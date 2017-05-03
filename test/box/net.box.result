@@ -1577,9 +1577,31 @@ c:eval("print('kek');", nil, {language = 'c++'})
 - error: 'builtin/box/net_box.lua..."]:<line>: eval language expected "lua" or "sql", got
     c++'
 ...
-c:eval("select * from ...", {"_space"}, {language = 'sql'})
+c:eval("select name, owner from _space", nil, {language = 'sql'})
 ---
-- error: eval does not support 'sql' language
+- - ['_schema', 1]
+  - ['_space', 1]
+  - ['_vspace', 1]
+  - ['_index', 1]
+  - ['_vindex', 1]
+  - ['_func', 1]
+  - ['_vfunc', 1]
+  - ['_user', 1]
+  - ['_vuser', 1]
+  - ['_priv', 1]
+  - ['_vpriv', 1]
+  - ['_cluster', 1]
+  - ['test', 1]
+...
+box.sql.execute('create table sqltable(id primary key)')
+---
+...
+c:eval("insert into sqltable values (1)", nil, {language = 'sql'})
+---
+- true
+...
+box.sql.execute('drop table sqltable')
+---
 ...
 -- unsupported methods
 c.space.test:get({1}, { buffer = ibuf})
