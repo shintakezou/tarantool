@@ -23,9 +23,11 @@ test:plan(38)
 -- Build some test data
 --
 test:do_test("select3-1.0", function()
-  test:execsql('DROP TABLE IF EXISTS t1;')
-  test:execsql('CREATE TABLE t1(n int primary key, log int);')
-  test:execsql('BEGIN;')
+  test:execsql [[
+    DROP TABLE IF EXISTS t1;
+    CREATE TABLE t1(n int primary key, log int);
+    BEGIN;
+  ]]
   for i = 1, 32-1 do -- in X(0, "X!for", [=[["set i 1","$i<32","incr i"]]=]) do
      j = 0
      while bit.lshift(1, j) < i do
@@ -311,10 +313,10 @@ test:do_execsql_test("select3-6.4", [[
   -- </select3-6.4>
 })
 
-test:do_test("select3-6.5", function()
-	test:execsql('CREATE INDEX i1 ON t1(log);')
-	return test:execsql('SELECT log, min(n) FROM t1 GROUP BY log ORDER BY log;')
-end, {
+test:do_execsql_test("select3-6.5", [[
+  CREATE INDEX i1 ON t1(log);
+  SELECT log, min(n) FROM t1 GROUP BY log ORDER BY log;
+]], {
   -- <select3-6.5>
   0, 1, 1, 2, 2, 3, 3, 5, 4, 9, 5, 17
   -- </select3-6.5>
@@ -346,12 +348,12 @@ test:do_execsql_test("select3-6.8", [[
 
 -- Sometimes an aggregate query can return no rows at all.
 --
-test:do_test("select3-7.1", function()
-	test:execsql('DROP TABLE IF EXISTS t2;')
-	test:execsql('CREATE TABLE t2(a primary key,b);')
-	test:execsql('INSERT INTO t2 VALUES(1,2);')
-	return test:execsql('SELECT a, sum(b) FROM t2 WHERE b=5 GROUP BY a;')
-end, {
+test:do_execsql_test("select3-7.1", [[
+  DROP TABLE IF EXISTS t2;
+  CREATE TABLE t2(a primary key,b);
+  INSERT INTO t2 VALUES(1,2);
+  SELECT a, sum(b) FROM t2 WHERE b=5 GROUP BY a;
+]], {
   -- <select3-7.1>
   
   -- </select3-7.1>
@@ -371,19 +373,18 @@ test:do_execsql_test("select3-7.2", [[
 -- Make sure the GROUP BY clause does this conversion correctly.
 -- Ticket #2251.
 --
-test:do_test("select3-8.1", function()
-  test:execsql('DROP TABLE IF EXISTS A;')
-  test:execsql [[
+test:do_execsql_test("select3-8.1", [[
+  DROP TABLE IF EXISTS A;
   CREATE TABLE A (
     A1 DOUBLE,
     A2 VARCHAR COLLATE NOCASE,
     A3 DOUBLE,
     id int primary key
-  ); ]]
-  test:execsql("INSERT INTO A VALUES(39136,'ABC',1201900000, 1);")
-  test:execsql("INSERT INTO A VALUES(39136,'ABC',1207000000, 2);")
-  return test:execsql('SELECT typeof(sum(a3)) FROM a;')
-end, {
+  );
+  INSERT INTO A VALUES(39136,'ABC',1201900000, 1);
+  INSERT INTO A VALUES(39136,'ABC',1207000000, 2);
+  SELECT typeof(sum(a3)) FROM a;
+]], {
   -- <select3-8.1>
   "real"
   -- </select3-8.1>

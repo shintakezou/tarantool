@@ -44,6 +44,47 @@ local function finish_test()
 end
 test.finish_test = finish_test
 
+local function trim(s)
+    return (s:gsub("^%s*(.-)%s*$", "%1"))
+end
+
+local function split_sql(query)
+    local res = {}
+    local in_quotes = false
+    local quote_type = nil
+    local prev_c = nil
+    local prev_sub_i = 1
+    for i = 1, query:len() do
+        local c = query:sub(i, i)
+        -- sqlite escapes quotes via their duplicating
+        if (c == '"' or c == "'") and prev_c ~= c then
+            if in_quotes and c == quote_type then
+                in_quotes = false
+            elseif not in_quotes then
+                in_quotes = true
+                quote_type = c
+            end
+        else
+            if not in_quotes and c == ';' then
+                table.insert(res, query:sub(prev_sub_i, i))
+                prev_sub_i = i + 1 -- without ;
+            end
+        end
+        prev_c = c
+    end
+    if prev_sub_i < query:len() then
+        table.insert(res, query:sub(prev_sub_i, query:len()))
+    end
+    -- Check if the last statement is whitespaces.
+    if #res > 0 then
+        local last_subq = res[#res]
+        if trim(last_subq):len() == 0 then
+            res[#res] = nil
+        end
+    end
+    return res
+end
+
 local function do_test(self, label, func, expect)
     local ok, result = pcall(func)
     if ok then
@@ -73,8 +114,8 @@ local function do_test(self, label, func, expect)
 end
 test.do_test = do_test
 
-local function execsql(self, sql)
-    local result = box.sql.execute(sql)
+local function execsql_one(query)
+    local result = box.sql.execute(query)
     if type(result) ~= 'table' and not box.tuple.is(v) then return end
 
     result = flatten(result)
@@ -84,6 +125,15 @@ local function execsql(self, sql)
 	end
     end
     return result
+end
+
+local function execsql(self, sql)
+    local queries = split_sql(sql)
+    local last_res = nil
+    for k, query in pairs(queries) do
+        last_res = execsql_one(query)
+    end
+    return last_res
 end
 test.execsql = execsql
 
