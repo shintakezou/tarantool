@@ -1201,24 +1201,6 @@ tx_manager_delete(struct tx_manager *m)
 	return 0;
 }
 
-/*
- * Determine a lowest possible vlsn - the level below which the
- * history could be compacted.
- * If there are active read views, it is the first's vlsn. If there is
- * no active read view, a read view could be created at any moment
- * with vlsn = m->lsn, so m->lsn must be chosen.
- */
-static int64_t
-tx_manager_vlsn(struct tx_manager *xm)
-{
-	if (rlist_empty(&xm->read_views))
-		return xm->lsn;
-	struct vy_read_view *oldest = rlist_first_entry(&xm->read_views,
-							struct vy_read_view,
-							in_read_views);
-	return oldest->vlsn;
-}
-
 enum vy_file_type {
 	VY_FILE_INDEX,
 	VY_FILE_RUN,
@@ -1774,7 +1756,7 @@ vy_write_iterator_new(struct vy_env *env, const struct key_def *key_def,
 		      struct tuple_format *surrogate_format,
 		      struct tuple_format *upsert_format,
 		      bool is_primary, uint64_t column_mask,
-		      bool is_last_level, int64_t oldest_vlsn);
+		      bool is_last_level, struct rlist *read_views);
 static NODISCARD int
 vy_write_iterator_add_slice(struct vy_write_iterator *wi,
 			    struct vy_slice *slice);
@@ -3863,7 +3845,7 @@ vy_task_dump_new(struct mempool *pool, struct vy_index *index,
 				   index->upsert_format,
 				   index->index_def->iid == 0,
 				   index->column_mask, is_last_level,
-				   tx_manager_vlsn(xm));
+				   &xm->read_views);
 	if (wi == NULL)
 		goto err_wi;
 
@@ -4096,7 +4078,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 				   index->upsert_format,
 				   index->index_def->iid == 0,
 				   index->column_mask, is_last_level,
-				   tx_manager_vlsn(xm));
+				   &xm->read_views);
 	if (wi == NULL)
 		goto err_wi;
 
@@ -8097,6 +8079,14 @@ vy_merge_iterator_next_lsn(struct vy_merge_iterator *itr, struct tuple **ret)
 /**
  * Squash in the single statement all rest statements of current key
  * starting from the current statement.
+ * @param itr Source of statements.
+ * @param[out] ret Result statement.
+ * @param suppress_error Ignore upsert errors.
+ * @param stat Upsert statistics.
+ * @param oldest_lsn Oldest lsn until need squash.
+ * @param last_not_squashed Last unsquashed statement. It is need to
+ *        be returned because vy_merge_iterator_next_lsn cannot
+ *        return it again later.
  *
  * @retval 0 success or EOF (*ret == NULL)
  * @retval -1 error
@@ -8105,9 +8095,11 @@ vy_merge_iterator_next_lsn(struct vy_merge_iterator *itr, struct tuple **ret)
 static NODISCARD int
 vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
 				struct tuple **ret, bool suppress_error,
-				struct vy_stat *stat)
+				struct vy_stat *stat, int64_t oldest_lsn,
+				struct tuple **last_not_squashed)
 {
 	*ret = NULL;
+	*last_not_squashed = NULL;
 	struct tuple *t = itr->curr_stmt;
 
 	if (t == NULL)
@@ -8124,6 +8116,10 @@ vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
 		}
 		if (next == NULL)
 			break;
+		if (vy_stmt_lsn(next) <= oldest_lsn) {
+			*last_not_squashed = next;
+			break;
+		}
 		struct tuple *applied;
 		applied = vy_apply_upsert(t, next, itr->key_def, itr->format,
 					  itr->upsert_format, itr->is_primary,
@@ -8179,42 +8175,53 @@ vy_merge_iterator_restore(struct vy_merge_iterator *itr,
  *
  * Background
  * ----------
- * Vinyl provides support for consistent read views. The oldest
- * active read view is maintained in the transaction manager.
- * To support it, when dumping or compacting statements on disk,
- * older versions need to be preserved, and versions outside
- * any active read view garbage collected. This task is handled
- * by the write iterator.
+ * Vinyl provides support for consistent read views. Write
+ * iterator merges statements between active read views.
  *
  * Filtering
  * ---------
  * Let's call each transaction consistent read view LSN vlsn.
+ * And let's consider one key and its set of statements with
+ * different lsns.
  *
- *	oldest_vlsn = MIN(vlsn) over all active transactions
+ * Write iterator has sorted in descending order a list of read
+ * view vlsns. First vlsn is always INT64_MAX because statements
+ * newer than the newest read view also can be merged.
+ * For example, list of read view vlsns: INT64_MAX, 20, 15, 10.
  *
- * Thus to preserve relevant data for every key and purge old
- * versions, the iterator works as follows:
+ * To merge, delete and skip as much statements as possible, the
+ * write iterator merges all statements between read view vlsns by
+ * the following algorithm:
  *
- *      If statement lsn is greater than oldest vlsn, the
- *      statement is preserved.
+ * 1. Get the newest vlsn (INT64_MAX) as 'current_vlsn' and next
+ *    vlsn in descending order as 'next_vlsn'.
  *
- *      Otherwise, if statement type is REPLACE/DELETE, then
- *      it's returned, and the iterator can proceed to the
- *      next key: the readers do not need the history.
+ * 2. Merge all statements with lsns (next_vlsn, current_vlsn].
  *
- *      Otherwise, the statement is UPSERT, and in order
- *      to restore the original tuple from UPSERT the reader
- *      does need the history: they need to look for an older
- *      statement to which the UPSERT can be applied to get
- *      a tuple. This older statement can be UPSERT as well,
- *      and so on.
- *	In other words, of statement type is UPSERT, the reader
- *	needs a range of statements from the youngest statement
- *	with lsn <= vlsn to the youngest non-UPSERT statement
- *	with lsn <= vlsn, borders included.
+ * 3. If some statements were unused (for example, if there was
+ *    REPLACE and some older statements), then skip them. Return
+ *    the result statement.
  *
- *	All other versions of this key can be skipped, and hence
- *	garbage collected.
+ * 4. Set current_vlsn = next_vlsn. Set next_vlsn to the next vlsn
+ *    in descending order. Go to the step 2.
+ *
+ * That is the write iterator merges subsequences of lsns of
+ * each key.
+ *       LSN:  L  L+1  L+2  L+3  L+4  L+5  L+6  L+7  L+8  ...  L+N
+ * READ VIEW:      *              *              *              *
+ *            \_____/\______________/\____________/\_____________/
+ *             merge       merge          merge         merge
+ *              a n d     r e t u r n    o n e    b y    o n e
+ *             <<< ---------- merge direction -------------------
+ *
+ * Consider the merging algorithm for each subsequence.
+ *
+ * - If the statement type is REPLACE/DELETE and it is not
+ *   optimized update, then it is the result statement. Finish
+ *   merge and go the next subsequence (or to the next key).
+ *
+ * - Otherwise the statement type is UPSERT. Squash them until
+ *   end of the subsequence.
  *
  * Squashing and garbage collection
  * --------------------------------
@@ -8226,49 +8233,9 @@ vy_merge_iterator_restore(struct vy_merge_iterator *itr,
  * multiple UPSERTs could be merged together to take up less
  * space, or substituted with REPLACE.
  *
- * Here's how it's done:
- *
- *
- *	1) Every statement with lsn greater than oldest vlsn is preserved
- *	in the output, since there could be an active transaction
- *	that needs it.
- *
- *	2) For all statements with lsn <= oldest_vlsn, only a single
- *	resultant statement is returned. Here's how.
- *
- *	2.1) If the youngest statement with lsn <= oldest _vlsn is a
- *	REPLACE/DELETE, it becomes the resultant statement.
- *
- *	2.2) Otherwise, it as an UPSERT. Then we must iterate over
- *	all older LSNs for this key until we find a REPLACE/DELETE
- *	or exhaust all input streams for this key.
- *
- *	If the older lsn is a yet another UPSERT, two upserts are
- *	squashed together into one. Otherwise we found an
- *	REPLACE/DELETE, so apply all preceding UPSERTs to it and
- *	get the resultant statement.
- *
- * There is an extra twist to this algorithm, used when performing
- * compaction of the last LSM level (i.e. merging all existing
- * runs into one). The last level does not need to store DELETEs.
- * Thus we can:
- * 1) Completely skip the resultant statement from output if it's
- *    a DELETE.
- *     |      ...      |       |     ...      |
- *     |               |       |              |    ^
- *     +- oldest vlsn -+   =   +- oldest lsn -+    ^ lsn
- *     |               |       |              |    ^
- *     |    DELETE     |       +--------------+
- *     |      ...      |
- * 2) Replace an accumulated resultant UPSERT with an appropriate
- *    REPLACE.
- *     |      ...      |       |     ...      |
- *     |     UPSERT    |       |   REPLACE    |
- *     |               |       |              |    ^
- *     +- oldest vlsn -+   =   +- oldest lsn -+    ^ lsn
- *     |               |       |              |    ^
- *     |    DELETE     |       +--------------+
- *     |      ...      |
+ * Result of the merging of each lsns subsequence is returned to
+ * the output, since there could be an active transaction that
+ * needs it.
  */
 struct vy_write_iterator {
 	/** Vinyl environment. */
@@ -8290,8 +8257,13 @@ struct vy_write_iterator {
 	bool is_primary;
 	/** Index column mask. */
 	uint64_t column_mask;
-	/* The minimal VLSN among all active transactions */
-	int64_t oldest_vlsn;
+	/**
+	 * Array of LSNs of read views, existing at the moment of
+	 * opening the iterator. Sorted descending.
+	 */
+	int64_t *rv_lsns;
+	/** Size of rv_lsns array. */
+	int rv_count;
 	/* There are is no level older than the one we're writing to. */
 	bool is_last_level;
 	/* On the next iteration we must move to the next key */
@@ -8303,6 +8275,8 @@ struct vy_write_iterator {
 	struct vy_iterator_stat mem_iterator_stat;
 	/* Usage statistics of run iterators */
 	struct vy_iterator_stat run_iterator_stat;
+	int current_rv_i;
+	struct tuple *last_not_squashed;
 };
 
 /*
@@ -8316,16 +8290,37 @@ vy_write_iterator_open(struct vy_write_iterator *wi, struct vy_env *env,
 		       struct tuple_format *surrogate_format,
 		       struct tuple_format *upsert_format,
 		       bool is_primary, uint64_t column_mask,
-		       bool is_last_level, uint64_t oldest_vlsn)
+		       bool is_last_level, struct rlist *read_views)
 {
+	int count = 1; /* One for the INT64_MAX. */
+	struct rlist *unused;
+	rlist_foreach(unused, read_views)
+		++count;
+	wi->rv_count = count;
+	wi->rv_lsns = (int64_t *) malloc(sizeof(int64_t) * count);
+	if (wi->rv_lsns == NULL) {
+		diag_set(OutOfMemory, sizeof(int64_t) * count, "malloc",
+			 "rv_lsns");
+		return -1;
+	}
+	wi->rv_lsns[0] = INT64_MAX;
+	count--;
+	struct vy_read_view *rv;
+	/* Descending order. */
+	rlist_foreach_entry(rv, read_views, in_read_views)
+		wi->rv_lsns[count--] = rv->vlsn;
+	assert(count == 0);
 	wi->env = env;
-	wi->oldest_vlsn = oldest_vlsn;
 	wi->is_last_level = is_last_level;
 	wi->goto_next_key = false;
+	wi->current_rv_i = 0;
+	wi->last_not_squashed = NULL;
 
 	wi->key = vy_stmt_new_select(env->key_format, NULL, 0);
-	if (wi->key == NULL)
+	if (wi->key == NULL) {
+		free(wi->rv_lsns);
 		return -1;
+	}
 	wi->key_def = key_def;
 	wi->user_key_def = user_key_def;
 	wi->surrogate_format = surrogate_format;
@@ -8345,7 +8340,7 @@ vy_write_iterator_new(struct vy_env *env, const struct key_def *key_def,
 		      struct tuple_format *surrogate_format,
 		      struct tuple_format *upsert_format,
 		      bool is_primary, uint64_t column_mask,
-		      bool is_last_level, int64_t oldest_vlsn)
+		      bool is_last_level, struct rlist *read_views)
 {
 	struct vy_write_iterator *wi = calloc(1, sizeof(*wi));
 	if (wi == NULL) {
@@ -8355,7 +8350,7 @@ vy_write_iterator_new(struct vy_env *env, const struct key_def *key_def,
 	if (vy_write_iterator_open(wi, env, key_def, user_key_def,
 				   surrogate_format, upsert_format,
 				   is_primary, column_mask,
-				   is_last_level, oldest_vlsn) != 0) {
+				   is_last_level, read_views) != 0) {
 		free(wi);
 		return NULL;
 	}
@@ -8421,26 +8416,62 @@ vy_write_iterator_next(struct vy_write_iterator *wi, struct tuple **ret)
 	wi->tmp_stmt = NULL;
 	struct vy_merge_iterator *mi = &wi->mi;
 	struct tuple *stmt = NULL;
+	int64_t merge_until_lsn = 0;
+	if (wi->current_rv_i + 1 < wi->rv_count)
+		merge_until_lsn = wi->rv_lsns[wi->current_rv_i + 1];
+	int64_t current_rv_lsn = INT64_MAX;
+	if (wi->current_rv_i < wi->rv_count)
+		current_rv_lsn = wi->rv_lsns[wi->current_rv_i];
 	/* @sa vy_write_iterator declaration for the algorithm description. */
 	while (true) {
 		if (wi->goto_next_key) {
 			wi->goto_next_key = false;
 			if (vy_merge_iterator_next_key(mi, &stmt))
 				return -1;
+			wi->current_rv_i = 0;
+			current_rv_lsn = wi->rv_lsns[0];
+			if (wi->rv_count > 1)
+				merge_until_lsn = wi->rv_lsns[1];
 		} else {
-			if (vy_merge_iterator_next_lsn(mi, &stmt))
-				return -1;
-			if (stmt == NULL &&
-			    vy_merge_iterator_next_key(mi, &stmt))
-				return -1;
+			if (wi->last_not_squashed == NULL) {
+				if (vy_merge_iterator_next_lsn(mi, &stmt))
+					return -1;
+			} else {
+				stmt = wi->last_not_squashed;
+			}
+			if (stmt == NULL) {
+				if (vy_merge_iterator_next_key(mi, &stmt) != 0)
+					return -1;
+				wi->current_rv_i = 0;
+				current_rv_lsn = wi->rv_lsns[0];
+				if (wi->rv_count > 1)
+					merge_until_lsn = wi->rv_lsns[1];
+			}
 		}
+		wi->last_not_squashed = NULL;
 		if (stmt == NULL)
 			return 0;
-		if (vy_stmt_lsn(stmt) > wi->oldest_vlsn)
-			break; /* Save the current stmt as the result. */
-		wi->goto_next_key = true;
-		if (vy_stmt_type(stmt) == IPROTO_DELETE && wi->is_last_level)
-			continue; /* Skip unnecessary DELETE */
+		if (vy_stmt_lsn(stmt) > current_rv_lsn)
+			/*
+			 * Skip statements, unmerged by the
+			 * previos read view and unvisible by the
+			 * current read view.
+			 */
+			continue;
+		wi->goto_next_key = merge_until_lsn == 0;
+		/*
+		 * Merge until next read view lsn.
+		 */
+		if (vy_stmt_type(stmt) == IPROTO_DELETE && wi->is_last_level &&
+		    merge_until_lsn == 0)
+			/*
+			 * Skip unnecessary DELETE on last level
+			 * if it is older than oldest read view.
+			 */
+			continue;
+
+		/* Propagate read views iterator. */
+		wi->current_rv_i++;
 		if (vy_stmt_type(stmt) == IPROTO_REPLACE ||
 		    vy_stmt_type(stmt) == IPROTO_DELETE) {
 			/*
@@ -8460,11 +8491,14 @@ vy_write_iterator_next(struct vy_write_iterator *wi, struct tuple **ret)
 
 		/* Squash upserts */
 		assert(vy_stmt_type(stmt) == IPROTO_UPSERT);
-		if (vy_merge_iterator_squash_upsert(mi, &stmt, false, NULL)) {
+		if (vy_merge_iterator_squash_upsert(mi, &stmt, false, NULL,
+						    merge_until_lsn,
+						    &wi->last_not_squashed)) {
 			tuple_unref(stmt);
 			return -1;
 		}
-		if (vy_stmt_type(stmt) == IPROTO_UPSERT && wi->is_last_level) {
+		if (vy_stmt_type(stmt) == IPROTO_UPSERT && wi->is_last_level &&
+		    merge_until_lsn == 0) {
 			/* Turn UPSERT to REPLACE. */
 			struct tuple *applied;
 			applied = vy_apply_upsert(stmt, NULL, wi->key_def,
@@ -8490,6 +8524,7 @@ vy_write_iterator_cleanup(struct vy_write_iterator *wi)
 	if (wi->tmp_stmt != NULL)
 		tuple_unref(wi->tmp_stmt);
 	wi->tmp_stmt = NULL;
+	free(wi->rv_lsns);
 	vy_merge_iterator_cleanup(&wi->mi);
 }
 
@@ -8784,7 +8819,7 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 	if (prev_key != NULL)
 		tuple_ref(prev_key);
 
-	struct tuple *t = NULL;
+	struct tuple *t = NULL, *unused;
 	struct vy_merge_iterator *mi = &itr->merge_iterator;
 	struct index_def *def = itr->index->index_def;
 	struct vy_stat *stat = itr->index->env->stat;
@@ -8807,7 +8842,8 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 			rc = 0; /* No more data. */
 			break;
 		}
-		rc = vy_merge_iterator_squash_upsert(mi, &t, true, stat);
+		rc = vy_merge_iterator_squash_upsert(mi, &t, true, stat, 0,
+						     &unused);
 		if (rc != 0) {
 			if (rc == -1)
 				goto clear;
@@ -8975,9 +9011,11 @@ vy_send_range(struct vy_join_ctx *ctx)
 	if (vy_slice_sort(&ctx->slices) != 0)
 		goto out;
 
+	struct rlist fake_read_views;
+	rlist_create(&fake_read_views);
 	ctx->wi = vy_write_iterator_new(ctx->env, ctx->key_def, ctx->key_def,
 					ctx->format, ctx->upsert_format,
-					true, 0, true, INT64_MAX);
+					true, 0, true, &fake_read_views);
 	if (ctx->wi == NULL)
 		goto out;
 

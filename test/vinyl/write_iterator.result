@@ -4,6 +4,9 @@ env = require('test_run')
 test_run = env.new()
 ---
 ...
+fiber = require('fiber')
+---
+...
 --
 -- Tests on data integrity after dump of memory runs or range
 -- compaction.
@@ -730,6 +733,427 @@ pk:get{2}
 pk:get{3}
 ---
 - [3, 'tuple 3']
+...
+space:drop()
+---
+...
+--
+-- gh-1920: squash subsequences of statements of the same key
+-- according to exising read views.
+--
+test_run:cmd("setopt delimiter ';'")
+---
+- true
+...
+function create_iterator(obj, key, opts)
+	local iter, key, state = obj:pairs(key, opts)
+	local res = {}
+	res['iter'] = iter
+	res['key'] = key
+	res['state'] = state
+	return res
+end;
+---
+...
+function iterator_next(iter_obj)
+	local st, tp = iter_obj.iter.gen(iter_obj.key, iter_obj.state)
+	return tp
+end;
+---
+...
+function iterate_over(iter_obj)
+	local tp = nil
+	local ret = {}
+	local i = 0
+	tp = iterator_next(iter_obj)
+	while tp do
+		ret[i] = tp
+		i = i + 1
+		tp = iterator_next(iter_obj)
+	end
+	return ret
+end;
+---
+...
+test_run:cmd("setopt delimiter ''");
+---
+- true
+...
+--
+--STATEMENT: REPL  DEL  REPL  REPL  REPL  REPL  REPL  REPL
+--LSN:        7     8    9     10    11    12    13    14
+--READ VIEW:  *          *                 *
+--          \____/\________/\_________________/\___________/
+--          merge   merge          merge           merge
+--
+space = box.schema.space.create('test', {engine = 'vinyl'})
+---
+...
+pk = space:create_index('pk')
+---
+...
+-- Open iterator after some statements and get one key from it to
+-- open read view.
+space:replace{1, 1}
+---
+- [1, 1]
+...
+space:replace{1, 2}
+---
+- [1, 2]
+...
+space:replace{1, 3}
+---
+- [1, 3]
+...
+space:replace{1, 4}
+---
+- [1, 4]
+...
+first_rv = create_iterator(pk)
+---
+...
+iterator_next(first_rv)
+---
+- [1, 4]
+...
+space:delete{1}
+---
+...
+space:replace{1, 5}
+---
+- [1, 5]
+...
+second_rv = create_iterator(pk)
+---
+...
+iterator_next(second_rv)
+---
+- [1, 5]
+...
+space:replace{1, 6}
+---
+- [1, 6]
+...
+space:replace{1, 7}
+---
+- [1, 7]
+...
+space:replace{1, 8}
+---
+- [1, 8]
+...
+third_rv = create_iterator(pk)
+---
+...
+iterator_next(third_rv)
+---
+- [1, 8]
+...
+space:replace{1, 9}
+---
+- [1, 9]
+...
+space:replace{1, 10}
+---
+- [1, 10]
+...
+box.snapshot()
+---
+- ok
+...
+-- Wait dump end
+while pk:info().run_count ~= 1 do fiber.sleep(0.01) end
+---
+...
+space:select{}
+---
+- - [1, 10]
+...
+space:drop()
+---
+...
+--
+--STATEMENT: UPS  UPS  UPS  UPS  UPS  UPS  UPS  UPS  UPS  UPS
+--LSN:        5    6    7    8    9   10   11   12   13   14
+--READ VIEW:       *                  *              *
+--          \________/\_________________/\_____________/\_____/
+--            squash         squash           squash     squash
+--
+space = box.schema.space.create('test', {engine = 'vinyl'})
+---
+...
+pk = space:create_index('pk', {run_count_per_level = 10})
+---
+...
+-- Create a run to turn off 'last level' optimizations of the
+-- write iterator.
+space:replace{1234}
+---
+- [1234]
+...
+box.snapshot()
+---
+- ok
+...
+-- Wait end of the dump
+while pk:info().run_count ~= 1 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 1}})
+---
+...
+-- Dump upsert, without converting into replace.
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 2 do fiber.sleep(0.01) end
+---
+...
+-- Dump 10 runs to fill the first level. And create some
+-- activated iterators to create read views.
+space:upsert({1}, {{'!', 2, 2}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 3 do fiber.sleep(0.01) end
+---
+...
+first_iter = create_iterator(pk)
+---
+...
+iterator_next(first_iter)
+---
+- [1, 2]
+...
+space:upsert({1}, {{'!', 2, 3}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 4 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 4}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 5 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 5}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 6 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 6}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 7 do fiber.sleep(0.01) end
+---
+...
+second_iter = create_iterator(pk)
+---
+...
+iterator_next(second_iter)
+---
+- [1, 6, 5, 4, 3, 2]
+...
+space:upsert({1}, {{'!', 2, 7}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 8 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 8}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 9 do fiber.sleep(0.01) end
+---
+...
+space:upsert({1}, {{'!', 2, 9}})
+---
+...
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 10 do fiber.sleep(0.01) end
+---
+...
+third_iter = create_iterator(pk)
+---
+...
+iterator_next(third_iter)
+---
+- [1, 9, 8, 7, 6, 5, 4, 3, 2]
+...
+space:upsert({1}, {{'!', 2, 10}})
+---
+...
+-- Dump 11-th run to trigger compaction. During compact new run
+-- will contain 4 squashed subsequences of lsns of the key {1}.
+box.snapshot()
+---
+- ok
+...
+while pk:info().run_count ~= 1 do fiber.sleep(0.01) end
+---
+...
+space:select{}
+---
+- - [1, 10, 9, 8, 7, 6, 5, 4, 3, 2]
+  - [1234]
+...
+space:drop()
+---
+...
+--
+--STATEMENT: REPL     DEL REPL     REPL
+--LSN:        5       6    6        7
+--READ VIEW:               *
+--           \_______________/\_______/
+--            \_____/\______/
+--             merge  skip as
+--                    optimized
+--                     update
+-- DEL and REPL with lsn 6 can be skipped for read view 6 for
+-- secondary index, because they do not change secondary key.
+--
+-- Secondary index can skip optimized update even in a case
+-- when there are older read views.
+space = box.schema.space.create('test', {engine = 'vinyl'})
+---
+...
+pk = space:create_index('pk', {run_count_per_level = 3, page_size = 80, range_size = 160})
+---
+...
+sec = space:create_index('sec', {parts = {2, 'unsigned'}, run_count_per_level = 3, page_size = 80, range_size = 160})
+---
+...
+-- Turn off 'last level' optimization.
+space:replace{1234, 1234}
+---
+- [1234, 1234]
+...
+box.snapshot()
+---
+- ok
+...
+while sec:info().run_count ~= 1 do fiber.sleep(0.01) end
+---
+...
+space:replace({1, 1})
+---
+- [1, 1]
+...
+box.snapshot()
+---
+- ok
+...
+while sec:info().run_count ~= 2 do fiber.sleep(0.01) end
+---
+...
+-- Fix read view for first REPLACE.
+first_iter = create_iterator(sec)
+---
+...
+iterator_next(first_iter)
+---
+- [1, 1]
+...
+-- Write something not optimized to dump both secondary and
+-- primary.
+space:replace{0, 0}
+---
+- [0, 0]
+...
+-- Create optimized REPLACE+DELETE. They will be skipped during
+-- secondary index dump.
+space:update({1}, {{'!', 3, 3}})
+---
+- [1, 1, 3]
+...
+get_res = nil
+---
+...
+-- Create a transaction with read view. After compaction this
+-- transaction will have to see optimized update from secondary
+-- index.
+f = fiber.create(function() box.begin() sec:get{1} fiber.sleep(1000) get_res = sec:get{1} box.commit() end)
+---
+...
+box.snapshot()
+---
+- ok
+...
+while sec:info().run_count ~= 3 do fiber.sleep(0.01) end
+---
+...
+-- Trigger compaction.
+prev_run_count = sec:info().run_count
+---
+...
+while sec:info().run_count >= prev_run_count do space:replace{1, 1, 1} box.snapshot() fiber.sleep(0.01) end
+---
+...
+f:wakeup()
+---
+...
+-- Wait get_res.
+while get_res == nil do fiber.sleep(0.01) end
+---
+...
+-- Secondary index skipped {1, 1, 3}, but contains key {1} in
+-- read view and {1, 1, 3} in primary index. And get_res must be
+-- {1, 1, 3}.
+get_res
+---
+- [1, 1, 3]
+...
+space:select{}
+---
+- - [0, 0]
+  - [1, 1, 1]
+  - [1234, 1234]
+...
+pk:select{}
+---
+- - [0, 0]
+  - [1, 1, 1]
+  - [1234, 1234]
+...
+sec:select{}
+---
+- - [0, 0]
+  - [1, 1, 1]
+  - [1234, 1234]
 ...
 space:drop()
 ---
