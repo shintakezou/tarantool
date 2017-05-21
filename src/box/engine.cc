@@ -214,6 +214,11 @@ Handler::commitAlterSpace(struct space *, struct space *)
 }
 
 void
+Handler::commitIndex(Index *)
+{
+}
+
+void
 Handler::executeSelect(struct txn *, struct space *space,
 		       uint32_t index_id, uint32_t iterator,
 		       uint32_t offset, uint32_t limit,

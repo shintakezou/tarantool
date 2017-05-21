@@ -224,10 +224,15 @@ public:
 		      const char *key, const char *key_end,
 		      struct port *);
 	/**
-	 * Create an instance of space index. Used in alter
-	 * space.
+	 * Create an instance of space index. Called on space
+	 * alter before WAL write, may throw an exception.
 	 */
 	virtual Index *createIndex(struct space *space, struct index_def*) = 0;
+	/**
+	 * Commit an index creation. Called on space alter
+	 * after WAL write, must not fail.
+	 */
+	virtual void commitIndex(Index *);
 	/**
 	 * Delete all tuples in the index on drop.
 	 */

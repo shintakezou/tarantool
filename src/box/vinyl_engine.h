@@ -39,7 +39,6 @@ struct VinylEngine: public Engine {
 	~VinylEngine();
 	virtual void init() override;
 	virtual Handler *open() override;
-	virtual void addPrimaryKey(struct space *space) override;
 	virtual void buildSecondaryKey(struct space *old_space,
 				       struct space *new_space,
 				       Index *new_index) override;

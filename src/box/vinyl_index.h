@@ -38,10 +38,9 @@
 struct VinylIndex: public Index
 {
 public:
-	VinylIndex(struct vy_env *env, struct index_def *index_def);
-
-	virtual void
-	open();
+	VinylIndex(struct index_def *index_def,
+		   struct vy_index *db): Index(index_def), db(db) {}
+	virtual ~VinylIndex() override;
 
 	virtual struct tuple*
 	findByKey(const char *key, uint32_t) const override;
@@ -70,8 +69,6 @@ public:
 	virtual void
 	info(struct info_handler *handler) const override;
 
-public:
-	struct vy_env *env;
 	struct vy_index *db;
 };
 

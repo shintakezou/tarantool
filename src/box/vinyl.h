@@ -223,18 +223,6 @@ vy_rollback_to_savepoint(struct vy_tx *tx, void *svp);
  */
 
 /**
- * Create a new vinyl index object without opening it.
- * @param e                    Vinyl environment.
- * @param user_index_def         Key definition declared by an user
- *                             with space:create_index().
- * @param space                Space for which the new index
- *                             belongs.
- */
-struct vy_index *
-vy_index_new(struct vy_env *e, struct index_def *user_index_def,
-	     struct space *space);
-
-/**
  * Hook on an preparation of space alter event.
  * @param old_space Old space.
  * @param new_space New space.
@@ -258,14 +246,18 @@ vy_prepare_alter_space(struct space *old_space, struct space *new_space);
 int
 vy_commit_alter_space(struct space *old_space, struct space *new_space);
 
-int
-vy_index_open(struct vy_index *index);
+struct vy_index *
+vy_index_create(struct vy_env *env, struct index_def *user_index_def,
+		struct space *space);
 
-/**
- * Close index and drop all data
- */
+void
+vy_index_commit(struct vy_index *index);
+
 void
 vy_index_drop(struct vy_index *index);
+
+void
+vy_index_destroy(struct vy_index *index);
 
 size_t
 vy_index_bsize(struct vy_index *db);

@@ -34,6 +34,7 @@
 #include "txn.h"
 #include "vinyl.h"
 #include "vy_stmt.h"
+#include "scoped_guard.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -147,23 +148,29 @@ VinylSpace::executeUpsert(struct txn *txn, struct space *space,
 Index *
 VinylSpace::createIndex(struct space *space, struct index_def *index_def)
 {
-	(void) space;
 	VinylEngine *engine = (VinylEngine *) this->engine;
-	if (index_def->type != TREE) {
-		unreachable();
-		return NULL;
-	}
-	return new VinylIndex(engine->env, index_def);
+	struct vy_index *db = vy_index_create(engine->env, index_def, space);
+	if (db == NULL)
+		diag_raise();
+	auto guard = make_scoped_guard([=] { vy_index_destroy(db); });
+	VinylIndex *i = new VinylIndex(index_def, db);
+	/* @db will be destroyed by VinylIndex destructor. */
+	guard.is_active = false;
+	return i;
+}
+
+void
+VinylSpace::commitIndex(Index *index)
+{
+	VinylIndex *i = (VinylIndex *)index;
+	vy_index_commit(i->db);
 }
 
 void
 VinylSpace::dropIndex(Index *index)
 {
 	VinylIndex *i = (VinylIndex *)index;
-	/* schedule asynchronous drop */
 	vy_index_drop(i->db);
-	i->db  = NULL;
-	i->env = NULL;
 }
 
 void

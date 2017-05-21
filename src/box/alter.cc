@@ -1058,6 +1058,7 @@ public:
 	virtual void prepare(struct alter_space *alter);
 	virtual void alter_def(struct alter_space *alter);
 	virtual void alter(struct alter_space *alter);
+	virtual void commit(struct alter_space *alter);
 	virtual ~AddIndex();
 };
 
@@ -1196,6 +1197,13 @@ AddIndex::alter(struct alter_space *alter)
 	on_replace = txn_alter_trigger_new(on_replace_in_old_space,
 					   new_index);
 	trigger_add(&alter->old_space->on_replace, on_replace);
+}
+
+void
+AddIndex::commit(struct alter_space *alter)
+{
+	Index *new_index = index_find_xc(alter->new_space, new_index_def->iid);
+	alter->new_space->handler->commitIndex(new_index);
 }
 
 AddIndex::~AddIndex()

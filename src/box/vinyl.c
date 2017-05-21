@@ -1604,6 +1604,10 @@ vy_range_tree_key_cmp(const struct tuple *stmt, struct vy_range *range)
 					range->index->key_def);
 }
 
+static struct vy_index *
+vy_index_new(struct vy_env *e, struct index_def *user_index_def,
+	     struct space *space);
+
 static void
 vy_index_delete(struct vy_index *index);
 
@@ -2918,15 +2922,10 @@ fail_range:
 
 /**
  * Create an index directory for a new index.
- * TODO: create index files only after the WAL
- * record is committed.
  */
 static int
-vy_index_create(struct vy_index *index)
+vy_index_mkdir(struct vy_index *index)
 {
-	struct vy_scheduler *scheduler = index->env->scheduler;
-
-	/* create directory */
 	int rc;
 	char path[PATH_MAX];
 	vy_index_snprint_path(path, sizeof(path), index->env->conf->path,
@@ -2955,26 +2954,6 @@ vy_index_create(struct vy_index *index)
 			 path);
 		return -1;
 	}
-
-	/* create initial range */
-	struct vy_range *range = vy_range_new(index, -1, NULL, NULL);
-	if (unlikely(range == NULL))
-		return -1;
-	vy_index_add_range(index, range);
-	vy_index_acct_range(index, range);
-	vy_scheduler_add_range(scheduler, range);
-	vy_scheduler_add_index(scheduler, index);
-
-	/*
-	 * Log change in metadata.
-	 */
-	vy_log_tx_begin();
-	vy_log_create_index(index->opts.lsn, index->id, index->space_id,
-			    index->user_key_def);
-	vy_log_insert_range(index->opts.lsn, range->id, NULL, NULL);
-	if (vy_log_tx_commit() < 0)
-		return -1;
-
 	return 0;
 }
 
@@ -3134,11 +3113,34 @@ out:
 	return success ? 0 : -1;
 }
 
+/**
+ * Recover an index structure from the metadata log
+ * and open the corresponding run files.
+ */
 static int
-vy_index_open_ex(struct vy_index *index)
+vy_index_recover(struct vy_index *index)
 {
 	struct vy_env *env = index->env;
 	assert(env->recovery != NULL);
+
+	struct vy_index_recovery_info *ri;
+	ri = vy_recovery_lookup_index(env->recovery, index->opts.lsn);
+	if (ri == NULL) {
+		if (env->status == VINYL_INITIAL_RECOVERY_LOCAL) {
+			diag_set(ClientError, ER_INVALID_VYLOG_FILE,
+				 tt_sprintf("Index %lld not found",
+					    (long long)index->opts.lsn));
+			return -1;
+		}
+		/*
+		 * If we failed to log index creation before restart,
+		 * we won't find it in the log on recovery. This is
+		 * OK as the index doesn't have any runs in this case.
+		 * We will retry to log index in vy_index_commit().
+		 */
+		assert(env->status == VINYL_FINAL_RECOVERY_LOCAL);
+		return 0;
+	}
 
 	struct vy_index_recovery_cb_arg arg = { .index = index };
 	arg.run_hash = mh_i64ptr_new();
@@ -3147,8 +3149,8 @@ vy_index_open_ex(struct vy_index *index)
 		return -1;
 	}
 
-	int rc = vy_recovery_iterate_index(env->recovery, index->opts.lsn,
-					   false, vy_index_recovery_cb, &arg);
+	int rc = vy_recovery_iterate_index(ri, false,
+			vy_index_recovery_cb, &arg);
 
 	mh_int_t k;
 	mh_foreach(arg.run_hash, k) {
@@ -3199,7 +3201,6 @@ vy_index_open_ex(struct vy_index *index)
 			return -1;
 		}
 		vy_index_acct_range(index, range);
-		vy_scheduler_add_range(env->scheduler, range);
 	}
 	if (prev == NULL) {
 		diag_set(ClientError, ER_INVALID_VYLOG_FILE,
@@ -3214,7 +3215,6 @@ vy_index_open_ex(struct vy_index *index)
 				    (long long)prev->id));
 		return -1;
 	}
-	vy_scheduler_add_index(env->scheduler, index);
 	return 0;
 }
 
@@ -5071,26 +5071,43 @@ vy_index_info(struct vy_index *index, struct info_handler *h)
 
 /** }}} Introspection */
 
+static int
+vy_index_do_create(struct vy_index *index)
+{
+	/* Create the initial range. */
+	struct vy_range *range = vy_range_new(index, -1, NULL, NULL);
+	if (range == NULL)
+		return -1;
+
+	vy_index_add_range(index, range);
+	vy_index_acct_range(index, range);
+
+	return vy_index_mkdir(index);
+}
+
 /**
  * Detect whether we already have non-garbage index files,
  * and open an existing index if that's the case. Otherwise,
  * create a new index. Take the current recovery status into
  * account.
  */
-static int
-vy_index_open_or_create(struct vy_index *index)
+struct vy_index *
+vy_index_create(struct vy_env *env, struct index_def *user_index_def,
+		struct space *space)
 {
-	/*
-	 * TODO: don't drop/recreate index in local wal
-	 * recovery mode if all operations already done.
-	 */
+	struct vy_index *index = vy_index_new(env, user_index_def, space);
+	if (index == NULL)
+		return NULL;
+
+	int rc;
 	switch (index->env->status) {
 	case VINYL_ONLINE:
 		/*
 		 * The recovery is complete, simply
 		 * create a new index.
 		 */
-		return vy_index_create(index);
+		rc = vy_index_do_create(index);
+		break;
 	case VINYL_INITIAL_RECOVERY_REMOTE:
 	case VINYL_FINAL_RECOVERY_REMOTE:
 		/*
@@ -5098,7 +5115,8 @@ vy_index_open_or_create(struct vy_index *index)
 		 * exist locally, and we should create the
 		 * index directory from scratch.
 		 */
-		return vy_index_create(index);
+		rc = vy_index_do_create(index);
+		break;
 	case VINYL_INITIAL_RECOVERY_LOCAL:
 	case VINYL_FINAL_RECOVERY_LOCAL:
 		/*
@@ -5107,23 +5125,72 @@ vy_index_open_or_create(struct vy_index *index)
 		 * have already been created, so try to load
 		 * the index files from it.
 		 */
-		return vy_index_open_ex(index);
+		rc = vy_index_recover(index);
+		break;
 	default:
 		unreachable();
 	}
+	if (rc != 0) {
+		vy_index_delete(index);
+		return NULL;
+	}
+	return index;
 }
 
-int
-vy_index_open(struct vy_index *index)
+/**
+ * Add a new index to the environment and log creation
+ * in the metadata log.
+ */
+void
+vy_index_commit(struct vy_index *index)
 {
 	struct vy_env *env = index->env;
+	struct vy_range *range;
 
-	if (vy_index_open_or_create(index) != 0)
-		return -1;
+	if (env->status == VINYL_INITIAL_RECOVERY_LOCAL ||
+	    env->status == VINYL_FINAL_RECOVERY_LOCAL) {
+		/*
+		 * Normally, if this is local recovery, the index
+		 * should have been logged before restart and added
+		 * to the scheduler by vy_index_recover(). There's
+		 * one exception though - we could've failed to log
+		 * index due to a vylog write error, in which case
+		 * the index isn't in the recovery context and we
+		 * need to retry to log it now.
+		 */
+		if (vy_recovery_lookup_index(env->recovery,
+					     index->opts.lsn) != NULL)
+			goto skip_log;
+	}
 
-	vy_index_ref(index);
+	assert(index->range_count == 1);
+	range = vy_range_tree_first(&index->tree);
+
+	/*
+	 * Since it's too late to fail now, in case of vylog write
+	 * failure we leave the records we attempted to write in
+	 * the log buffer so that they are flushed along with the
+	 * next write request. If they don't get flushed before
+	 * the instance is shut down, we will replay them on local
+	 * recovery.
+	 */
+	vy_log_tx_begin();
+	vy_log_create_index(index->opts.lsn, index->id,
+			    index->space_id, index->user_key_def);
+	vy_log_insert_range(index->opts.lsn, range->id, NULL, NULL);
+	if (vy_log_tx_try_commit() != 0)
+		say_warn("failed to log index creation: %s",
+			 diag_last_error(diag_get())->errmsg);
+skip_log:
+	/*
+	 * Once the index creation had been logged, we can
+	 * schedule a task for it.
+	 */
+	for (range = vy_range_tree_first(&index->tree); range != NULL;
+	     range = vy_range_tree_next(&index->tree, range))
+		vy_scheduler_add_range(env->scheduler, range);
+	vy_scheduler_add_index(env->scheduler, index);
 	rlist_add(&env->indexes, &index->link);
-	return 0;
 }
 
 static void
@@ -5140,6 +5207,10 @@ vy_index_unref(struct vy_index *index)
 		vy_index_delete(index);
 }
 
+/**
+ * Remove a dropped index from the environment and log drop
+ * in the metadata log.
+ */
 void
 vy_index_drop(struct vy_index *index)
 {
@@ -5147,10 +5218,6 @@ vy_index_drop(struct vy_index *index)
 	int64_t index_id = index->opts.lsn;
 	bool was_dropped = index->is_dropped;
 
-	/* TODO:
-	 * don't drop/recreate index in local wal recovery mode if all
-	 * operations are already done.
-	 */
 	index->is_dropped = true;
 	rlist_del(&index->link);
 
@@ -5163,7 +5230,7 @@ vy_index_drop(struct vy_index *index)
 	 * on local recovery from WAL.
 	 */
 	if (env->status == VINYL_FINAL_RECOVERY_LOCAL && was_dropped)
-		goto free_index;
+		return;
 
 	vy_log_tx_begin();
 	int loops = 0;
@@ -5187,7 +5254,19 @@ vy_index_drop(struct vy_index *index)
 	if (vy_log_tx_try_commit() < 0)
 		say_warn("failed to log drop index: %s",
 			 diag_last_error(diag_get())->errmsg);
-free_index:
+}
+
+/**
+ * Destroy an index.
+ *
+ * Since the index may still be referenced by an asynchronous
+ * task performing dump or compaction, this function does not
+ * free it immediately, instead it only drops a reference
+ * taken by vy_index_create().
+ */
+void
+vy_index_destroy(struct vy_index *index)
+{
 	vy_index_unref(index);
 }
 
@@ -5234,7 +5313,7 @@ vy_tuple_format_new_upsert(struct tuple_format *space_format)
 	return format;
 }
 
-struct vy_index *
+static struct vy_index *
 vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	     struct space *space)
 {
@@ -5325,6 +5404,7 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	if (index->mem == NULL)
 		goto fail_mem;
 
+	index->refs = 1;
 	index->generation = scheduler->generation;
 	index->dump_lsn = -1;
 	vy_cache_create(&index->cache, &e->cache_env, key_def);
