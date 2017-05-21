@@ -498,6 +498,24 @@ MemtxSpace::dropIndex(Index *index)
 }
 
 void
+MemtxSpace::commitTruncateSpace(struct space *old_space,
+				struct space *new_space)
+{
+	(void)new_space;
+	struct MemtxIndex *index = (MemtxIndex *) space_index(old_space, 0);
+	if (index == NULL)
+		return;
+	/*
+	 * Delete all tuples in the old space.
+	 */
+	struct iterator *it = index->position();
+	index->initIterator(it, ITER_ALL, NULL, 0);
+	struct tuple *tuple;
+	while ((tuple = it->next(it)))
+		tuple_unref(tuple);
+}
+
+void
 MemtxSpace::prepareAlterSpace(struct space *old_space, struct space *new_space)
 {
 	(void)new_space;

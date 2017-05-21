@@ -204,6 +204,11 @@ Handler::executeUpsert(struct txn *, struct space *, struct request *)
 }
 
 void
+Handler::commitTruncateSpace(struct space *, struct space *)
+{
+}
+
+void
 Handler::prepareAlterSpace(struct space *, struct space *)
 {
 }

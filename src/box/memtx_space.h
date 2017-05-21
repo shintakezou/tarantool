@@ -80,6 +80,8 @@ struct MemtxSpace: public Handler {
 	virtual Index *createIndex(struct space *space,
 				   struct index_def *index_def) override;
 	virtual void dropIndex(Index *index) override;
+	virtual void commitTruncateSpace(struct space *old_space,
+					 struct space *new_space) override;
 	virtual void prepareAlterSpace(struct space *old_space,
 				       struct space *new_space) override;
 public:

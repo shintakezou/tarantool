@@ -246,6 +246,9 @@ vy_prepare_alter_space(struct space *old_space, struct space *new_space);
 int
 vy_commit_alter_space(struct space *old_space, struct space *new_space);
 
+void
+vy_commit_truncate_space(struct space *old_space, struct space *new_space);
+
 struct vy_index *
 vy_index_create(struct vy_env *env, struct index_def *user_index_def,
 		struct space *space);

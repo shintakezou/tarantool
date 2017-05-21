@@ -607,6 +607,11 @@ struct vy_index {
 	 * Used to make sure that the primary index is dumped last.
 	 */
 	int pin_count;
+	/**
+	 * The number of times the index was truncated
+	 * (see also space_opts->truncate_count).
+	 */
+	int64_t truncate_count;
 };
 
 /** Return index name. Used for logging. */
@@ -3040,6 +3045,10 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 		assert(record->index_lsn == index->opts.lsn);
 		index->dump_lsn = record->dump_lsn;
 		break;
+	case VY_LOG_TRUNCATE_INDEX:
+		assert(record->index_lsn == index->opts.lsn);
+		index->truncate_count = record->truncate_count;
+		break;
 	case VY_LOG_DROP_INDEX:
 		assert(record->index_lsn == index->opts.lsn);
 		index->is_dropped = true;
@@ -5207,6 +5216,32 @@ vy_index_unref(struct vy_index *index)
 		vy_index_delete(index);
 }
 
+/*
+ * Delete all runs, ranges, and slices of a given index
+ * from the metadata log.
+ */
+static void
+vy_index_log_prune(struct vy_index *index)
+{
+	int loops = 0;
+	for (struct vy_range *range = vy_range_tree_first(&index->tree);
+	     range != NULL; range = vy_range_tree_next(&index->tree, range)) {
+		struct vy_slice *slice;
+		rlist_foreach_entry(slice, &range->slices, in_range)
+			vy_log_delete_slice(slice->id);
+		vy_log_delete_range(range->id);
+		if (++loops % VY_YIELD_LOOPS == 0)
+			fiber_sleep(0);
+	}
+	struct vy_run *run;
+	int64_t gc_lsn = vclock_sum(&index->env->scheduler->last_checkpoint);
+	rlist_foreach_entry(run, &index->runs, in_index) {
+		vy_log_drop_run(run->id, gc_lsn);
+		if (++loops % VY_YIELD_LOOPS == 0)
+			fiber_sleep(0);
+	}
+}
+
 /**
  * Remove a dropped index from the environment and log drop
  * in the metadata log.
@@ -5214,8 +5249,6 @@ vy_index_unref(struct vy_index *index)
 void
 vy_index_drop(struct vy_index *index)
 {
-	struct vy_env *env = index->env;
-	int64_t index_id = index->opts.lsn;
 	bool was_dropped = index->is_dropped;
 
 	index->is_dropped = true;
@@ -5229,28 +5262,12 @@ vy_index_drop(struct vy_index *index)
 	 * not flushed before the instance is shut down, we replay it
 	 * on local recovery from WAL.
 	 */
-	if (env->status == VINYL_FINAL_RECOVERY_LOCAL && was_dropped)
+	if (index->env->status == VINYL_FINAL_RECOVERY_LOCAL && was_dropped)
 		return;
 
 	vy_log_tx_begin();
-	int loops = 0;
-	for (struct vy_range *range = vy_range_tree_first(&index->tree);
-	     range != NULL; range = vy_range_tree_next(&index->tree, range)) {
-		struct vy_slice *slice;
-		rlist_foreach_entry(slice, &range->slices, in_range)
-			vy_log_delete_slice(slice->id);
-		vy_log_delete_range(range->id);
-		if (++loops % VY_YIELD_LOOPS == 0)
-			fiber_sleep(0);
-	}
-	struct vy_run *run;
-	int64_t gc_lsn = vclock_sum(&env->scheduler->last_checkpoint);
-	rlist_foreach_entry(run, &index->runs, in_index) {
-		vy_log_drop_run(run->id, gc_lsn);
-		if (++loops % VY_YIELD_LOOPS == 0)
-			fiber_sleep(0);
-	}
-	vy_log_drop_index(index_id);
+	vy_index_log_prune(index);
+	vy_log_drop_index(index->opts.lsn);
 	if (vy_log_tx_try_commit() < 0)
 		say_warn("failed to log drop index: %s",
 			 diag_last_error(diag_get())->errmsg);
@@ -5268,6 +5285,95 @@ void
 vy_index_destroy(struct vy_index *index)
 {
 	vy_index_unref(index);
+}
+
+/**
+ * Delete truncated indexes, add indexes created by truncation
+ * to the environment, and log the change in metadata.
+ *
+ * See also: vy_index_commit() and vy_index_drop().
+ */
+void
+vy_commit_truncate_space(struct space *old_space, struct space *new_space)
+{
+	assert(old_space->index_count == new_space->index_count);
+	uint32_t index_count = new_space->index_count;
+	if (index_count == 0)
+		return;
+
+	struct vy_env *env = vy_index(new_space->index[0])->env;
+	bool need_log = true;
+
+	/*
+	 * Mark old indexes as dropped. After this point
+	 * no task can be scheduled or completed for any
+	 * of them (only aborted).
+	 */
+	for (uint32_t i = 0; i < index_count; i++) {
+		struct vy_index *old_index = vy_index(old_space->index[i]);
+		struct vy_index *index = vy_index(new_space->index[i]);
+		/*
+		 * If we are replaying WAL we need to:
+		 *
+		 *  1. Propagate is_dropped flag loaded from the
+		 *     metadata log to the new index.
+		 *
+		 *  2. Skip logging truncate unless we failed to
+		 *     log it before restart.
+		 */
+		if (env->status == VINYL_FINAL_RECOVERY_LOCAL) {
+			index->is_dropped = old_index->is_dropped;
+			if (old_index->truncate_count >
+			    old_space->def.opts.truncate_count) {
+				index->truncate_count =
+					old_index->truncate_count;
+				need_log = false;
+			}
+		}
+		old_index->is_dropped = true;
+		rlist_del(&old_index->link);
+	}
+	if (!need_log)
+		goto skip_log;
+
+	/*
+	 * Log change in metadata.
+	 *
+	 * Since we can't fail here, in case of vylog write failure
+	 * we leave records we failed to write in vylog buffer so
+	 * that they get flushed along with the next write. If they
+	 * don't, we will replay them during WAL recovery (see the
+	 * comment above).
+	 */
+	vy_log_tx_begin();
+	for (uint32_t i = 0; i < index_count; i++) {
+		struct vy_index *old_index = vy_index(old_space->index[i]);
+		struct vy_index *index = vy_index(new_space->index[i]);
+		struct vy_range *range = vy_range_tree_first(&index->tree);
+
+		assert(!index->is_dropped);
+		assert(index->range_count == 1);
+		vy_index_log_prune(old_index);
+		vy_log_insert_range(index->opts.lsn, range->id, NULL, NULL);
+		vy_log_truncate_index(index->opts.lsn, index->truncate_count);
+	}
+	if (vy_log_tx_try_commit() < 0)
+		say_warn("failed to log index truncation: %s",
+			 diag_last_error(diag_get())->errmsg);
+skip_log:
+	/*
+	 * Add new indexes to the environment. After this point
+	 * they become eligible for dump and compaction.
+	 */
+	for (uint32_t i = 0; i < index_count; i++) {
+		struct vy_index *index = vy_index(new_space->index[i]);
+		struct vy_range *range = vy_range_tree_first(&index->tree);
+
+		assert(index->range_count == 1);
+		rlist_add(&env->indexes, &index->link);
+		vy_scheduler_add_range(env->scheduler, range);
+		vy_scheduler_add_index(env->scheduler, index);
+	}
 }
 
 extern struct tuple_format_vtab vy_tuple_format_vtab;
@@ -5419,6 +5525,7 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	index->space_format = space->format;
 	tuple_format_ref(index->space_format, 1);
 	index->space_index_count = space->index_count;
+	index->truncate_count = space->def.opts.truncate_count;
 	index->in_dump.pos = UINT32_MAX;
 	index->space_id = user_index_def->space_id;
 	index->id = user_index_def->iid;
@@ -5731,16 +5838,20 @@ vy_tx_set(struct vy_tx *tx, struct vy_index *index, struct tuple *stmt)
  * replaying records already present in the database. In this
  * case avoid overwriting a newer version with an older one.
  *
- * If the index is going to be dropped on WAL recovery,
- * there's no point in replaying statements for it either.
+ * If the index is going to be dropped or truncated on WAL
+ * recovery, there's no point in replaying statements for it,
+ * either.
  */
 static inline bool
-vy_is_committed_one(struct vy_tx *tx, struct vy_index *index)
+vy_is_committed_one(struct vy_tx *tx, struct space *space,
+		    struct vy_index *index)
 {
 	struct vy_env *env = tx->xm->env;
 	if (likely(env->status != VINYL_FINAL_RECOVERY_LOCAL))
 		return false;
 	if (index->is_dropped)
+		return true;
+	if (index->truncate_count > space->def.opts.truncate_count)
 		return true;
 	if (vclock_sum(env->recovery_vclock) <= index->dump_lsn)
 		return true;
@@ -5759,7 +5870,7 @@ vy_is_committed(struct vy_tx *tx, struct space *space)
 		return false;
 	for (uint32_t iid = 0; iid < space->index_count; iid++) {
 		struct vy_index *index = vy_index(space->index[iid]);
-		if (!vy_is_committed_one(tx, index))
+		if (!vy_is_committed_one(tx, space, index))
 			return false;
 	}
 	return true;
@@ -6006,7 +6117,7 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 	if (pk == NULL) /* space has no primary key */
 		return -1;
 	/* Primary key is dumped last. */
-	assert(!vy_is_committed_one(tx, pk));
+	assert(!vy_is_committed_one(tx, space, pk));
 	assert(pk->id == 0);
 	new_stmt = vy_stmt_new_replace(space->format, request->tuple,
 				       request->tuple_end);
@@ -6038,7 +6149,7 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 	for (uint32_t iid = 1; iid < space->index_count; ++iid) {
 		struct vy_index *index;
 		index = vy_index(space->index[iid]);
-		if (vy_is_committed_one(tx, index))
+		if (vy_is_committed_one(tx, space, index))
 			continue;
 		/*
 		 * Delete goes first, so if old and new keys
@@ -6191,7 +6302,7 @@ vy_delete_impl(struct vy_tx *tx, struct space *space,
 	if (pk == NULL)
 		return -1;
 	/* Primary key is dumped last. */
-	assert(!vy_is_committed_one(tx, pk));
+	assert(!vy_is_committed_one(tx, space, pk));
 	struct tuple *delete =
 		vy_stmt_new_surrogate_delete(space->format, tuple);
 	if (delete == NULL)
@@ -6203,7 +6314,7 @@ vy_delete_impl(struct vy_tx *tx, struct space *space,
 	struct vy_index *index;
 	for (uint32_t i = 1; i < space->index_count; ++i) {
 		index = vy_index(space->index[i]);
-		if (vy_is_committed_one(tx, index))
+		if (vy_is_committed_one(tx, space, index))
 			continue;
 		if (vy_tx_set(tx, index, delete) != 0)
 			goto error;
@@ -6360,7 +6471,7 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	assert(pk != NULL);
 	assert(pk->id == 0);
 	/* Primary key is dumped last. */
-	assert(!vy_is_committed_one(tx, pk));
+	assert(!vy_is_committed_one(tx, space, pk));
 	uint64_t column_mask = 0;
 	const char *new_tuple, *new_tuple_end;
 	uint32_t new_size, old_size;
@@ -6423,7 +6534,7 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	assert(delete != NULL);
 	for (uint32_t i = 1; i < space->index_count; ++i) {
 		index = vy_index(space->index[i]);
-		if (vy_is_committed_one(tx, index))
+		if (vy_is_committed_one(tx, space, index))
 			continue;
 		if (vy_tx_set(tx, index, delete) != 0)
 			goto error;
@@ -6525,7 +6636,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	if (pk == NULL)
 		return -1;
 	/* Primary key is dumped last. */
-	assert(!vy_is_committed_one(tx, pk));
+	assert(!vy_is_committed_one(tx, space, pk));
 	if (tuple_validate_raw(space->format, tuple))
 		return -1;
 
@@ -6629,7 +6740,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	assert(delete != NULL);
 	for (uint32_t i = 1; i < space->index_count; ++i) {
 		index = vy_index(space->index[i]);
-		if (vy_is_committed_one(tx, index))
+		if (vy_is_committed_one(tx, space, index))
 			continue;
 		if (vy_tx_set(tx, index, delete) != 0)
 			goto error;

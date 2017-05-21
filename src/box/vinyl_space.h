@@ -52,6 +52,8 @@ struct VinylSpace: public Handler {
 	virtual void dropIndex(Index *) override;
 	virtual Index *createIndex(struct space *, struct index_def *) override;
 	virtual void commitIndex(Index *) override;
+	virtual void commitTruncateSpace(struct space *old_space,
+					 struct space *new_space) override;
 	virtual void prepareAlterSpace(struct space *old_space,
 				       struct space *new_space) override;
 	/**
