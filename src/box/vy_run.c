@@ -163,34 +163,99 @@ vy_run_delete(struct vy_run *run)
 }
 
 /**
- * Search a page in a run that may contain a given key.
- * Return the index of the found page or -1 if the key is
- * less than the min key stored in the run. Additionally,
- * @equal is set if the min key of the found page is equal
- * to the given key and cleared otherwise.
+ * Set first_page_no member and possibly throw away slice->begin tuple.
+ * Search a page in a run that may contain the beginning (since one particular
+ * key can spread through several pages) of slice->begin key
+ *  and save it in first_page_no member. If the slice->begin key is definitely
+ *  not present in the run then unref and nullify slice->begin.
+ * Normally searches the highest (with maximal index) page that
+ *  has min_key < slice->begin (not '<=' like in last page search).
  */
-static int
-vy_run_search_page(struct vy_run *run, const struct tuple *key,
-		   const struct key_def *key_def, bool *equal)
+static void
+vy_slice_set_up_beginning(struct vy_slice *slice, const struct key_def *key_def)
 {
-	int beg = 0;
-	int end = run->info.count;
+	if (slice->begin == NULL || slice->run->info.count == 0) {
+		slice->first_page_no = 0;
+		return;
+	}
+	uint32_t beg = 0;
+	uint32_t end = slice->run->info.count;
 	while (beg != end) {
-		int mid = beg + (end - beg) / 2;
-		struct vy_page_info *page_info = vy_run_page_info(run, mid);
+		uint32_t mid = beg + (end - beg) / 2;
+		struct vy_page_info *page_info = vy_run_page_info(slice->run,
+								  mid);
 		int cmp = key_compare(page_info->min_key,
-				tuple_data(key), key_def);
-		if (cmp == 0) {
-			*equal = true;
-			return mid;
-		}
+				      tuple_data(slice->begin), key_def);
 		if (cmp < 0)
 			beg = mid + 1;
 		else
 			end = mid;
 	}
-	*equal = false;
-	return end - 1;
+	if (end == 0) {
+		/**
+		 * The first page's min key is >= slice->begin.
+		 * Thus slice->begin is useless and could be omitted.
+		 */
+		tuple_unref(slice->begin);
+		slice->begin = NULL;
+		slice->first_page_no = 0;
+		return;
+	}
+	/**
+	 * end page's min key is >= slice->begin (or end is out of bounds),
+	 * and the previous page is the goal.
+	 */
+	slice->first_page_no = end - 1;
+}
+
+/**
+ * Set last_page_no member and possibly throw away slice->end tuple.
+ * Search a page in a run that may contain the end (since one particular
+ * key can spread through several pages) of slice->end key
+ *  and save it in last_page_no member. If the slice->end key is definitely
+ *  not present in the run then unref and nullify slice->end.
+ * Normally searches the highest (with maximal index) page that
+ *  has min_key <= slice->end (not '<' like in first page search).
+ */
+static void
+vy_slice_set_up_end(struct vy_slice *slice, const struct key_def *key_def)
+{
+	if (slice->run->info.count == 0) {
+		slice->last_page_no = 0;
+		return;
+	} else if (slice->end == NULL) {
+		slice->last_page_no = slice->run->info.count - 1;
+		return;
+	}
+	uint32_t beg = 0;
+	uint32_t end = slice->run->info.count;
+	while (beg != end) {
+		uint32_t mid = beg + (end - beg) / 2;
+		struct vy_page_info *page_info = vy_run_page_info(slice->run,
+								  mid);
+		int cmp = key_compare(page_info->min_key,
+				      tuple_data(slice->end), key_def);
+		if (cmp <= 0)
+			beg = mid + 1;
+		else
+			end = mid;
+	}
+	if (end == 0) {
+		/**
+		 * The first page's min key is > slice->end.
+		 * Actually that means that the slice is empty, but there's
+		 *  no way to mark it as empty in this unlikely case.
+		 */
+		assert(slice->first_page_no  == 0); /* begin's less than end */
+		assert(slice->begin == NULL); /* begin's less than end */
+		slice->last_page_no = 0;
+		return;
+	}
+	/**
+	 * end page's min key is > slice->end (or end is out of bounds),
+	 * and the previous page is the goal.
+	 */
+	slice->last_page_no = end - 1;
 }
 
 struct vy_slice *
@@ -220,26 +285,14 @@ vy_slice_new(int64_t id, struct vy_run *run,
 	 * Lookup the first and the last page of this slice
 	 * in the run and estimate the slice size.
 	 */
-	bool equal;
-	int page_no = -1;
-	if (end != NULL) {
-		page_no = vy_run_search_page(run, end, key_def, &equal);
-		/* End key doesn't belong to slice. */
-		if (equal)
-			page_no--;
-	} else if (run->info.count > 0)
-		page_no = run->info.count - 1;
-	if (page_no >= 0) {
-		slice->last_page_no = page_no;
-		page_no = (begin == NULL ? 0 :
-			   vy_run_search_page(run, begin, key_def, &equal));
-		slice->first_page_no = page_no > 0 ? page_no : 0;
-		uint64_t count = slice->last_page_no - slice->first_page_no + 1;
-		slice->keys = DIV_ROUND_UP(run->info.keys * count,
-					   run->info.count);
-		slice->size = DIV_ROUND_UP(run->info.size * count,
-					   run->info.count);
-	} /* else the slice is empty */
+	vy_slice_set_up_beginning(slice, key_def);
+	vy_slice_set_up_end(slice, key_def);
+	assert(slice->last_page_no >= slice->first_page_no);
+	uint64_t count = slice->last_page_no - slice->first_page_no + 1;
+	slice->keys = DIV_ROUND_UP(run->info.keys * count,
+				   run->info.count);
+	slice->size = DIV_ROUND_UP(run->info.size * count,
+				   run->info.count);
 	return slice;
 }
 
