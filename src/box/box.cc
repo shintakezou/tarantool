@@ -949,7 +949,7 @@ access_check_func(const char *name, uint32_t name_len)
 		char name_buf[BOX_NAME_MAX + 1];
 		snprintf(name_buf, sizeof(name_buf), "%.*s", name_len, name);
 		struct user *user = user_find_xc(credentials->uid);
-		tnt_raise(ClientError, ER_FUNCTION_ACCESS_DENIED,
+		tnt_raise(LoggedError, ER_FUNCTION_ACCESS_DENIED,
 			  priv_name(access), user->def.name, name_buf);
 	}
 
