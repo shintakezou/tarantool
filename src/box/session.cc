@@ -37,6 +37,7 @@
 #include "trigger.h"
 #include "random.h"
 #include "user.h"
+#include "backtrace.h"
 
 static struct mh_i64ptr_t *session_registry;
 
@@ -54,6 +55,16 @@ sid_max()
 	while (++sid_max == 0)
 		;
 	return sid_max;
+}
+
+void
+credentials_copy(struct credentials *dst, struct credentials *src)
+{
+	*dst = *src;
+	say_warn("credentials_copy");
+	void *frame = __builtin_frame_address(0);
+	const char *bt = backtrace(frame, fiber()->stack, fiber()->stack_size);
+	say_warn("credentials copy backtrace:\n%s", bt);
 }
 
 static void
@@ -132,6 +143,9 @@ struct credentials admin_credentials;
 static int
 session_run_triggers(struct session *session, struct rlist *triggers)
 {
+	if (rlist_empty(triggers))
+		return 0;
+
 	assert(session == current_session());
 
 	/* Save original credentials */
