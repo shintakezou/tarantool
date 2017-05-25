@@ -706,3 +706,9 @@ s[3]:select({}, {iterator = 'LE'})
 box.rollback()
 
 for i=1,3 do s[i]:drop() end
+
+
+ffi = require('ffi')
+ffi.cdef("const char *vy_test_mem_stream(); const char *vy_test_write_iterator();")
+ffi.string(ffi.C.vy_test_mem_stream())
+ffi.string(ffi.C.vy_test_write_iterator())

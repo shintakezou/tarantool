@@ -328,3 +328,6 @@ luaJIT_setmode
 luaJIT_profile_start
 luaJIT_profile_stop
 luaJIT_profile_dumpstack
+
+vy_test_mem_stream
+vy_test_write_iterator
